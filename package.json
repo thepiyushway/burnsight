@@ -1,6 +1,6 @@
 {
   "name": "burnsight",
-  "displayName": "burnsight",
+  "displayName": "BurnSight",
   "description": "Real-time AI coding economics for VSCode",
   "version": "0.0.1",
   "engines": {
@@ -10,14 +10,15 @@
     "Other"
   ],
   "activationEvents": [
-    "*"
+    "onStartupFinished",
+    "onCommand:burnsight.openOverlay"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "burnsight.helloWorld",
-        "title": "Hello World"
+        "command": "burnsight.openOverlay",
+        "title": "BurnSight: Open Telemetry Overlay"
       }
     ]
   },
