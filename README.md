@@ -1,71 +1,146 @@
-# burnsight README
+# BurnSight
 
-This is the README for your extension "burnsight". After writing up a brief description, we recommend including the following sections.
+BurnSight is a VS Code extension for realtime observability of GitHub Copilot Chat runtime behavior.
 
-## Features
+It is a telemetry-driven analytics layer that reads observable Copilot runtime logs, reconstructs request lifecycle events, and computes estimated economics for the current live session.
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+BurnSight does not use official Copilot billing APIs and does not claim billing-accurate token or cost parity.
 
-For example if there is an image subfolder under your extension project workspace:
+## What BurnSight Is Today
 
-\!\[feature X\]\(images/feature-x.png\)
+BurnSight currently is:
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+- A realtime AI observability extension for GitHub Copilot Chat in VS Code
+- A telemetry-driven runtime analytics system
+- An estimated AI economics monitor for the active session
 
-## Requirements
+BurnSight currently works by reconstructing activity from observable VS Code/Copilot telemetry logs, not by querying provider-native usage APIs.
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+## Core Capabilities (Current Implementation)
 
-## Extension Settings
+BurnSight currently implements:
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+- Live Copilot telemetry discovery and ingestion from VS Code log roots
+- Realtime request lifecycle tracking from canonical `ccreq:...` events
+- Model attribution detection (including routed model chain extraction)
+- Workflow/feature classification from runtime telemetry markers
+- Retry detection (`retry` marker and retry count extraction)
+- Escalation detection from model chain hops (for example `modelA -> modelB`)
+- Estimated token accounting based on deterministic heuristics
+- Estimated economics calculation using pricing registry lookup
+- Session-scoped aggregation (request counts, latency, model/workflow distributions)
+- Live dashboard updates in a VS Code webview overlay
+- Runtime observability output in `BurnSight Telemetry` output channel
 
-For example:
+BurnSight does not currently provide:
 
-This extension contributes the following settings:
+- Official Copilot billing totals
+- Exact provider token counts
+- Provider-native API usage reconciliation
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+## How It Works
 
-## Known Issues
+High-level runtime path:
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+`GitHub Copilot Runtime -> VS Code telemetry logs -> BurnSight discovery engine -> live log tailing -> parser normalization -> telemetry aggregation -> economics estimation -> reactive dashboard UI`
 
-## Release Notes
+Concrete runtime architecture:
 
-Users appreciate release notes as you update your extension.
+- Discovery: recursively scans VS Code logs on macOS, validates Copilot sources by path/signature tokens, and attaches file watchers
+- Ingestion: tails append-only file deltas using byte offsets and EOF attach semantics
+- Parsing: extracts canonical request records, model, status, latency, workflow tag, provider markers
+- Deduping: suppresses duplicate lines/events by fingerprint and request/source offsets
+- Enrichment: computes estimated tokens and estimated cost per request
+- Aggregation: updates session metrics, timeline, model/workflow rollups, and burn-rate estimate
+- UI sync: debounced view model publication to webview and incremental DOM patching
 
-### 1.0.0
+Detailed technical documentation is in [docs/architecture.md](docs/architecture.md).
 
-Initial release of ...
+## Telemetry Strategy
 
-### 1.0.1
+BurnSight classifies metrics by confidence level:
 
-Fixed issue #.
+- `REAL`: direct log-observed fields (request IDs, model strings, latency markers, statuses, workflow tags)
+- `ESTIMATED`: deterministic calculations derived from real telemetry (token/cost/burn-rate estimates)
+- `HEURISTIC`: inference where direct observability is impossible (for example some runtime edit signals)
 
-### 1.1.0
+All accounting is session-local and event-driven. Metrics are updated only when validated telemetry events are ingested.
 
-Added features X, Y, and Z.
+## Important Limitations
 
----
+The following constraints are fundamental to current behavior:
 
-## Following extension guidelines
+- VS Code exposes no official Copilot token or billing API to this extension
+- Economics in BurnSight are estimates, not invoice truth
+- Token counts are heuristic/estimated from observable runtime signals
+- Billing parity is not achievable through currently available public APIs
+- Model/provider attribution depends on telemetry markers present in runtime logs
+- Telemetry schemas may change with VS Code/Copilot releases
 
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
+## Current Status
 
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
+- Status: Alpha / experimental
+- Platform support: macOS (current discovery root implementation)
+- Primary target: GitHub Copilot Chat runtime in VS Code
+- Architecture maturity: stable event-driven runtime pipeline, evolving estimation and analytics depth
 
-## Working with Markdown
+## Screenshots
 
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
+Screenshots are not yet committed in this repository. Placeholders:
 
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
+- `[Dashboard screenshot placeholder](docs/assets/dashboard-placeholder.png)`
+- `[Telemetry log screenshot placeholder](docs/assets/telemetry-placeholder.png)`
+- `[Live economics example placeholder](docs/assets/economics-placeholder.png)`
 
-## For more information
+## Development
 
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
+Requirements:
 
-**Enjoy!**
+- Node.js and pnpm
+- VS Code (extension development host)
+- macOS for current runtime log discovery path
+
+Common commands:
+
+```bash
+pnpm install
+pnpm run check-types
+pnpm run lint
+pnpm run compile
+```
+
+Watch mode:
+
+```bash
+pnpm run watch
+```
+
+Run tests:
+
+```bash
+pnpm test
+```
+
+## Roadmap (Realistic Near-Term)
+
+- Windows and Linux discovery/tailing support
+- Historical session analytics beyond current live-session focus
+- Richer economics modeling and calibration controls
+- Additional provider adapters and attribution normalization
+- Trend charts and time-series views in overlay UI
+- Deeper AI workflow analytics (routing patterns, retry heatmaps)
+
+## Contributing
+
+Contributions are welcome. BurnSight is built as an architecture-first observability system.
+
+When contributing:
+
+- Prefer observability-driven development with explicit confidence labels
+- Preserve event-driven pipeline boundaries (discovery -> parse -> enrich -> aggregate -> present)
+- Keep telemetry assumptions auditable and documented
+- Avoid introducing claims of billing truth without direct official API evidence
+
+## License
+
+See repository license information when published.
