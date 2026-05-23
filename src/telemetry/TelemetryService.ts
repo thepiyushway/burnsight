@@ -152,6 +152,12 @@ export class TelemetryService implements vscode.Disposable {
   }
 
   private ingestRuntimeEvent(event: CopilotLogEvent): void {
+    const sourcePath = (event.sourceFile ?? '').toLowerCase();
+    if (sourcePath.includes('burnsight')) {
+      this.log.warn('[TelemetryService] ingestion aborted: self-source detected (burnsight)');
+      return;
+    }
+
     if (this.debugEnabled) {
       this.log.info(`[RAW TELEMETRY] ${event.raw}`);
     }

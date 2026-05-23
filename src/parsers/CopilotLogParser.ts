@@ -39,6 +39,25 @@ export class CopilotLogParser implements vscode.Disposable {
   /** Recent line fingerprints to suppress duplicate emitted events */
   private readonly recentLineFingerprints = new Map<string, number>();
   private readonly dedupeWindowMs = 3000;
+  private readonly acceptedWatcherPaths = new Set<string>();
+
+  private readonly hardIgnoreTokens = [
+    'burnsight',
+    'telemetry',
+    'runtimeinspector',
+    'extension-output',
+  ] as const;
+
+  private readonly acceptedSourceTokens = [
+    'github.copilot',
+    'github.copilot-chat',
+    'copilot-chat',
+    'copilotmd',
+    'ccreq',
+    'copilot',
+    'github-authentication',
+    'github.authentication',
+  ] as const;
 
   constructor(
     private readonly bus: EventBus<BurnSightEvents>,
@@ -82,6 +101,8 @@ export class CopilotLogParser implements vscode.Disposable {
       for (const dir of copilotDirs) {
         this.watchDirectory(dir);
       }
+
+      this.logAcceptedWatcherSummary();
     } catch (err) {
       this.log.error(`[CopilotLogParser] Discovery failed: ${String(err)}`);
     }
@@ -109,6 +130,11 @@ export class CopilotLogParser implements vscode.Disposable {
         }
 
         const childPath = path.join(dir, entry.name);
+        if (this.shouldIgnoreFile(childPath)) {
+          this.log.info(`[WATCHER] ignored self-log: ${childPath}`);
+          continue;
+        }
+
         if (/github\.copilot-chat/i.test(entry.name) || /copilot/i.test(entry.name)) {
           results.push(childPath);
         }
@@ -135,9 +161,15 @@ export class CopilotLogParser implements vscode.Disposable {
       );
       watcher.onDidCreate((uri) => {
         try {
+          if (this.shouldIgnoreFile(uri.fsPath)) {
+            this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
+            return;
+          }
+
           if (fs.statSync(uri.fsPath).isDirectory() && /copilot/i.test(path.basename(uri.fsPath))) {
             this.log.info(`[CopilotLogParser] Copilot dir appeared: ${uri.fsPath}`);
             this.watchDirectory(uri.fsPath);
+            this.logAcceptedWatcherSummary();
           }
         } catch {
           // ignore
@@ -155,21 +187,48 @@ export class CopilotLogParser implements vscode.Disposable {
 
   /** Reads existing log files in the directory and installs a watcher. */
   private watchDirectory(dir: string): void {
+    if (this.shouldIgnoreFile(dir)) {
+      this.log.info(`[WATCHER] ignored self-log: ${dir}`);
+      return;
+    }
+
+    this.log.info(`[WATCHER] accepted copilot-log: ${dir}`);
+    this.acceptedWatcherPaths.add(dir);
     this.log.info(`[CopilotLogParser] Watching directory: ${dir}`);
 
     // Ingest any log lines already written before we started
     try {
       const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
       for (const file of files) {
-        this.readNewContent(path.join(dir, file));
+        const filePath = path.join(dir, file);
+        if (this.shouldIgnoreFile(filePath)) {
+          this.log.info(`[WATCHER] ignored self-log: ${filePath}`);
+          continue;
+        }
+        this.log.info(`[WATCHER] accepted copilot-log: ${filePath}`);
+        this.readNewContent(filePath);
       }
     } catch { /* ignore — directory may be temporarily unavailable */ }
 
     // Watch for appended content going forward
     const pattern = new vscode.RelativePattern(vscode.Uri.file(dir), '**/*.log');
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-    watcher.onDidChange((uri) => this.readNewContent(uri.fsPath));
-    watcher.onDidCreate((uri) => this.readNewContent(uri.fsPath));
+    watcher.onDidChange((uri) => {
+      if (this.shouldIgnoreFile(uri.fsPath)) {
+        this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
+        return;
+      }
+      this.log.info(`[WATCHER] accepted copilot-log: ${uri.fsPath}`);
+      this.readNewContent(uri.fsPath);
+    });
+    watcher.onDidCreate((uri) => {
+      if (this.shouldIgnoreFile(uri.fsPath)) {
+        this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
+        return;
+      }
+      this.log.info(`[WATCHER] accepted copilot-log: ${uri.fsPath}`);
+      this.readNewContent(uri.fsPath);
+    });
     this.subscriptions.push(watcher);
   }
 
@@ -183,6 +242,11 @@ export class CopilotLogParser implements vscode.Disposable {
    * CONFIDENCE: REAL — we read raw bytes written by Copilot's log channel.
    */
   private readNewContent(filePath: string): void {
+    if (this.shouldIgnoreFile(filePath)) {
+      this.log.info(`[WATCHER] ignored self-log: ${filePath}`);
+      return;
+    }
+
     try {
       const stats = fs.statSync(filePath);
       const lastPos = this.filePositions.get(filePath) ?? 0;
@@ -224,6 +288,11 @@ export class CopilotLogParser implements vscode.Disposable {
    * CONFIDENCE of extracted fields: REAL (see LogPatterns.ts for rationale).
    */
   private parseLine(line: string, sourceFile: string): void {
+    if (this.shouldIgnoreSourceLine(sourceFile, line)) {
+      this.log.info('[WATCHER] ignored self-log');
+      return;
+    }
+
     if (!Patterns.isRelevantLine(line)) {
       return;
     }
@@ -320,6 +389,53 @@ export class CopilotLogParser implements vscode.Disposable {
 
     this.recentLineFingerprints.set(fingerprint, now);
     return false;
+  }
+
+  private shouldIgnoreFile(filePath: string): boolean {
+    const normalized = filePath.toLowerCase();
+    const hasHardIgnoreToken = this.hardIgnoreTokens.some((token) => normalized.includes(token));
+    if (hasHardIgnoreToken) {
+      return true;
+    }
+
+    const hasAcceptedToken = this.acceptedSourceTokens.some((token) => normalized.includes(token));
+    if (!hasAcceptedToken) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private shouldIgnoreSourceLine(sourceFile: string, line: string): boolean {
+    const source = sourceFile.toLowerCase();
+    const raw = line.toLowerCase();
+
+    if (source.includes('burnsight')) {
+      return true;
+    }
+
+    if (
+      raw.includes('burnsight') ||
+      raw.includes('runtimeinspector') ||
+      raw.includes('burnsight telemetry')
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private logAcceptedWatcherSummary(): void {
+    const accepted = [...this.acceptedWatcherPaths];
+    if (accepted.length === 0) {
+      this.log.warn('[WATCHER] accepted watcher paths: none');
+      return;
+    }
+
+    this.log.info(`[WATCHER] accepted watcher paths (${accepted.length}):`);
+    for (const watcherPath of accepted) {
+      this.log.info(`[WATCHER] accepted copilot-log: ${watcherPath}`);
+    }
   }
 
   // --------------------------------------------------------------------------
