@@ -10,8 +10,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:burnsight.openOverlay"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -19,8 +18,22 @@
       {
         "command": "burnsight.openOverlay",
         "title": "BurnSight: Open Telemetry Overlay"
+      },
+      {
+        "command": "burnsight.toggleDebugMode",
+        "title": "BurnSight: Toggle Debug Mode"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "BurnSight",
+      "properties": {
+        "burnsight.debugTelemetry": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable raw telemetry debug output in the BurnSight output channel."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "pnpm run package",

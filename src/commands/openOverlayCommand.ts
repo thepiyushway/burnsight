@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { OverlayPanel } from '../overlay/OverlayPanel';
+import { OverlayPanel } from '../ui/OverlayPanel';
 
 export const OPEN_OVERLAY_COMMAND = 'burnsight.openOverlay';
 

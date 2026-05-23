@@ -208,6 +208,22 @@ body[data-debug='true'] .debug-shell {
   white-space: nowrap;
 }
 
+.debug-events {
+  margin-top: 8px;
+  border-top: 1px solid rgba(45, 62, 74, 0.55);
+  padding-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.debug-event {
+  font-size: 10px;
+  color: #90a3b2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .card {
   border: 1px solid var(--line-hard);
   background: linear-gradient(180deg, #070b11 0%, #05090e 100%);

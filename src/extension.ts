@@ -3,74 +3,71 @@ import {
   OPEN_OVERLAY_COMMAND,
   registerOpenOverlayCommand,
 } from './commands/openOverlayCommand';
-import { MetricRegistry, registerDefaultMetrics } from './metrics/MetricRegistry';
-import { OverlayPanel } from './overlay/OverlayPanel';
-import { RuntimeTelemetryProvider } from './providers/RuntimeTelemetryProvider';
-import { SessionEngine } from './sessions/SessionEngine';
+import {
+  registerToggleDebugModeCommand,
+} from './commands/toggleDebugModeCommand';
+import { CopilotLogParser } from './parsers/CopilotLogParser';
 import { RuntimeInspector } from './telemetry/RuntimeInspector';
-import { TelemetryEngine } from './telemetry/TelemetryEngine';
+import { TelemetryService } from './services/TelemetryService';
 import { BurnSightEvents, SessionState } from './telemetry/types';
+import { OverlayPanel } from './ui/OverlayPanel';
 import { EventBus } from './utils/EventBus';
 
 export function activate(context: vscode.ExtensionContext) {
   const bus = new EventBus<BurnSightEvents>();
-  const sessionEngine = new SessionEngine(bus);
-  const runtimeInspector = new RuntimeInspector(bus);
-  const metricRegistry = new MetricRegistry();
-  registerDefaultMetrics(metricRegistry);
-  const telemetryProvider = new RuntimeTelemetryProvider();
+  const output = vscode.window.createOutputChannel('BurnSight Telemetry', { log: true });
 
-  const telemetryEngine = new TelemetryEngine({
-    bus,
-    sessionEngine,
-    metricRegistry,
-    telemetryProvider,
-  });
-
-  const overlayPanel = new OverlayPanel(context, telemetryEngine);
+  const telemetryService = TelemetryService.initialize(bus, output);
+  const logParser = new CopilotLogParser(bus, output, context.logUri.fsPath);
+  const runtimeInspector = new RuntimeInspector(bus, output);
+  const overlayPanel = new OverlayPanel(context, telemetryService, bus);
 
   registerOpenOverlayCommand(context, overlayPanel);
+  registerToggleDebugModeCommand(context);
 
   const statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
-    100
+    35
   );
 
-  statusBarItem.text = '◉ Idle';
+  statusBarItem.text = '⚡ $0.00';
   statusBarItem.tooltip = 'BurnSight: Open operational telemetry overlay';
   statusBarItem.command = OPEN_OVERLAY_COMMAND;
 
-  const updateStatusBar = (): void => {
-    const snapshot = telemetryEngine.getSnapshot();
+  const updateStatusBar = (snapshot = telemetryService.getSnapshot()): void => {
+    const sessionCard = snapshot.cards.find((card) => card.kind === 'session');
+    const costValue = sessionCard?.kind === 'session' ? sessionCard.mainValue : '$0.00';
+    const isHot = Number(costValue.replace(/[^0-9.]/g, '')) >= 1;
+    const prefix = isHot ? '🔥' : '⚡';
 
     if (snapshot.runtimeState === SessionState.ACTIVE) {
-      statusBarItem.text = `◉ ${snapshot.cards[0]?.kind === 'session' ? snapshot.cards[0].mainValue : '$0.00'}`;
-      statusBarItem.tooltip = 'BurnSight: Active telemetry session';
+      statusBarItem.text = `${prefix} ${costValue}`;
+      statusBarItem.tooltip = 'BurnSight: Active telemetry (derived from Copilot runtime events)';
       return;
     }
 
-    if (snapshot.runtimeState === SessionState.BURST) {
-      statusBarItem.text = `🔥 ${snapshot.cards[0]?.kind === 'session' ? snapshot.cards[0].mainValue : '$0.00'}`;
-      statusBarItem.tooltip = 'BurnSight: Inference burst detected';
-      return;
-    }
-
-    if (snapshot.runtimeState === SessionState.COOLING) {
-      statusBarItem.text = '◉ Cooling';
-      statusBarItem.tooltip = 'BurnSight: Runtime cooling down';
-      return;
-    }
-
-    statusBarItem.text = '◉ Idle';
-    statusBarItem.tooltip = 'BurnSight: Idle telemetry';
+    statusBarItem.text = `${prefix} ${costValue}`;
+    statusBarItem.tooltip = 'BurnSight: Waiting for Copilot runtime telemetry';
   };
 
-  context.subscriptions.push(telemetryEngine.onSnapshot(updateStatusBar));
+  context.subscriptions.push(
+    bus.on('statusbar.update', (snapshot) => {
+      updateStatusBar(snapshot);
+    })
+  );
+
   updateStatusBar();
 
   statusBarItem.show();
 
-  context.subscriptions.push(statusBarItem, runtimeInspector, telemetryEngine, overlayPanel);
+  context.subscriptions.push(
+    statusBarItem,
+    output,
+    runtimeInspector,
+    logParser,
+    telemetryService,
+    overlayPanel
+  );
 }
 
 export function deactivate() {}

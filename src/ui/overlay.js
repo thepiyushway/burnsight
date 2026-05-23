@@ -17,32 +17,6 @@ function safeText(value) {
   return value === undefined || value === null ? '' : String(value);
 }
 
-function parseCurrency(value) {
-  return Number(String(value || '').replace(/[^0-9.-]/g, '')) || 0;
-}
-
-function animateValue(element, from, to, formatter, durationMs) {
-  if (!element || Number.isNaN(from) || Number.isNaN(to)) {
-    return;
-  }
-
-  const start = performance.now();
-
-  const tick = (now) => {
-    const elapsed = now - start;
-    const progress = Math.min(1, elapsed / durationMs);
-    const eased = 1 - Math.pow(1 - progress, 3);
-    const value = from + (to - from) * eased;
-    element.textContent = formatter(value);
-
-    if (progress < 1) {
-      requestAnimationFrame(tick);
-    }
-  };
-
-  requestAnimationFrame(tick);
-}
-
 function renderCard(card) {
   if (card.kind === 'session') {
     return renderSessionCard(card);
@@ -63,8 +37,6 @@ function applyRuntimeState(snapshot) {
 }
 
 function applyAnimatedValues(snapshot) {
-  const prevCards = previousSnapshot ? previousSnapshot.cards || [] : [];
-  const prevSession = prevCards.find((card) => card.kind === 'session' && card.id === 'session');
   const nextSession = (snapshot.cards || []).find(
     (card) => card.kind === 'session' && card.id === 'session'
   );
@@ -77,29 +49,11 @@ function applyAnimatedValues(snapshot) {
   const ctxEl = cardsRoot.querySelector('[data-animate="context-remaining"]');
 
   if (burnEl) {
-    const fromBurn = prevSession ? parseCurrency(prevSession.mainValue) : parseCurrency(nextSession.mainValue);
-    const toBurn = parseCurrency(nextSession.mainValue);
-
-    animateValue(
-      burnEl,
-      fromBurn,
-      toBurn,
-      (value) => '$' + value.toFixed(2),
-      snapshot.runtimeState === 'BURST' ? 180 : 320
-    );
+    burnEl.textContent = safeText(nextSession.mainValue);
   }
 
   if (ctxEl) {
-    const fromCtx = prevSession ? Number(prevSession.progressPct || 0) : Number(nextSession.progressPct || 0);
-    const toCtx = Number(nextSession.progressPct || 0);
-
-    animateValue(
-      ctxEl,
-      fromCtx,
-      toCtx,
-      (value) => Math.round(value) + '%',
-      300
-    );
+    ctxEl.textContent = safeText(nextSession.progressValue);
   }
 }
 

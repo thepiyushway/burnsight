@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
-import { TelemetryEngine } from '../telemetry/TelemetryEngine';
+import { BurnSightEvents } from '../telemetry/types';
+import { EventBus } from '../utils/EventBus';
+import { TelemetryService } from '../telemetry/TelemetryService';
 import { getOverlayHtml } from './template';
 
 export class OverlayPanel implements vscode.Disposable {
@@ -9,10 +11,11 @@ export class OverlayPanel implements vscode.Disposable {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly telemetryEngine: TelemetryEngine
+    private readonly telemetryService: TelemetryService,
+    private readonly bus: EventBus<BurnSightEvents>
   ) {
     this.subscriptions.push(
-      this.telemetryEngine.onSnapshot((snapshot) => {
+      this.bus.on('ui.webviewUpdate', (snapshot) => {
         if (!this.panel || !this.ready) {
           return;
         }
@@ -31,7 +34,7 @@ export class OverlayPanel implements vscode.Disposable {
       if (this.ready) {
         void this.panel.webview.postMessage({
           type: 'overlay:update',
-          payload: this.telemetryEngine.getSnapshot(),
+          payload: this.telemetryService.getSnapshot(),
         });
       }
       return;
@@ -47,7 +50,7 @@ export class OverlayPanel implements vscode.Disposable {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'src', 'overlay')],
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'src', 'ui')],
       }
     );
 
@@ -59,7 +62,7 @@ export class OverlayPanel implements vscode.Disposable {
           this.ready = true;
           void this.panel.webview.postMessage({
             type: 'overlay:update',
-            payload: this.telemetryEngine.getSnapshot(),
+            payload: this.telemetryService.getSnapshot(),
           });
         }
       })

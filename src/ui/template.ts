@@ -2,10 +2,10 @@ import * as vscode from 'vscode';
 
 export function getOverlayHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const stylesheetUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, 'src', 'overlay', 'styles.css')
+    vscode.Uri.joinPath(extensionUri, 'src', 'ui', 'styles.css')
   );
   const scriptUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, 'src', 'overlay', 'overlay.js')
+    vscode.Uri.joinPath(extensionUri, 'src', 'ui', 'overlay.js')
   );
 
   const csp = [
@@ -30,11 +30,10 @@ export function getOverlayHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     <div class="header">
       <div class="header-left">
         <span class="header-mark">[>]</span>
-        <span class="header-title" id="title">ECON_FORECAST_V1</span>
+        <span class="header-title" id="title">BURNSIGHT_RUNTIME_OBSERVABILITY</span>
       </div>
       <div class="header-right">
         <span class="live-pill" id="live-pill"><span class="live-dot"></span><span id="runtime-label">IDLE</span></span>
-        <span>CFG</span>
       </div>
     </div>
 
@@ -43,8 +42,8 @@ export function getOverlayHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     <div class="debug-shell" id="debug-shell"></div>
 
     <div class="footer-bar">
-      <span id="version">v0.8.2-BETA</span>
-      <span class="footer-links">DOCS REPORTS</span>
+      <span id="version">v2.0.0-runtime</span>
+      <span class="footer-links">RUNTIME TELEMETRY</span>
     </div>
   </div>
 
