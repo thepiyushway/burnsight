@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { TelemetryEngine } from '../telemetry/TelemetryEngine';
-import { getOverlayHtml } from './overlayHtml';
+import { getOverlayHtml } from './template';
 
 export class OverlayPanel implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
@@ -47,6 +47,7 @@ export class OverlayPanel implements vscode.Disposable {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'src', 'overlay')],
       }
     );
 

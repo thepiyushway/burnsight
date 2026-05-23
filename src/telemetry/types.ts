@@ -4,6 +4,58 @@ export interface ModelCostEntry {
   cost: number;
 }
 
+export enum SessionState {
+  IDLE = 'IDLE',
+  ACTIVE = 'ACTIVE',
+  BURST = 'BURST',
+  COOLING = 'COOLING',
+}
+
+export type RuntimeSignalType =
+  | 'probable_ai_generation'
+  | 'probable_manual_typing'
+  | 'rewrite_burst'
+  | 'apply_changes'
+  | 'large_diff'
+  | 'rapid_delete';
+
+export interface RuntimeSignal {
+  type: RuntimeSignalType;
+  confidence: number;
+  source: string;
+  timestamp: number;
+  metadata?: {
+    fileName?: string;
+    insertedChars?: number;
+    insertedLines?: number;
+    deletedChars?: number;
+    insertionVelocity?: number;
+    preview?: string;
+    command?: string;
+  };
+}
+
+export interface RuntimeObservation {
+  fileName: string;
+  insertedChars: number;
+  insertedLines: number;
+  deletedChars: number;
+  insertionTimestamp: number;
+  insertionVelocity: number;
+  looksAiGenerated: boolean;
+  confidence: number;
+  previewSnippet: string;
+}
+
+export interface RuntimeDebugSnapshot {
+  enabled: boolean;
+  lastSignalType: string;
+  lastSignalConfidence: string;
+  probableAiInsertion: string;
+  lastCopilotCommand: string;
+  lastInsertionVelocity: string;
+}
+
 export interface TelemetryState {
   sessionBurn: number;
   contextRemainingPct: number;
@@ -67,10 +119,25 @@ export interface OverlaySnapshot {
   title: string;
   isLive: boolean;
   version: string;
+  runtimeState: SessionState;
+  runtimeLabel: string;
+  debug: RuntimeDebugSnapshot;
   cards: OverlayCardSnapshot[];
 }
 
 export interface BurnSightEvents {
-  'session.tick': { elapsedMs: number };
+  'session.tick': { elapsedMs: number; state: SessionState };
+  'session.stateChanged': {
+    previous: SessionState;
+    current: SessionState;
+    reason: string;
+  };
+  'runtime.observation': RuntimeObservation;
+  'runtime.signal': RuntimeSignal;
+  'runtime.command': {
+    command: string;
+    timestamp: number;
+    isCopilotRelated: boolean;
+  };
   'telemetry.snapshot': OverlaySnapshot;
 }
