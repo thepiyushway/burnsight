@@ -1,15 +1,16 @@
 // ---------------------------------------------------------------------------
 // Confidence classification — every derived metric carries one of these.
-// REAL      = directly observed from a VSCode/Copilot API or log line with
-//             no interpretation or approximation.
-// ESTIMATED = calculated from REAL observations using a published formula
-//             (e.g. tokens ≈ chars / 4; cost = tokens × published price).
-// HEURISTIC = inferred through approximation when direct observation is
-//             impossible (e.g. per-request input context size).
+// REAL      = directly observed from a VSCode/Copilot API or log line.
+// OBSERVED  = captured from runtime signals without provable completeness.
+// ESTIMATED = calculated from REAL/OBSERVED using a well-known formula.
+// INFERRED  = deduced from indirect evidence (e.g. latency → throughput).
+// HEURISTIC = approximated from model profiles and workflow weights.
 // ---------------------------------------------------------------------------
 export enum ConfidenceLevel {
   REAL = 'REAL',
+  OBSERVED = 'OBSERVED',
   ESTIMATED = 'ESTIMATED',
+  INFERRED = 'INFERRED',
   HEURISTIC = 'HEURISTIC',
 }
 
@@ -330,6 +331,26 @@ export interface OverlaySnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Ephemeral runtime debug state \u2014 NOT persisted to disk.
+// Carried alongside SessionTelemetry in the 'session.updated' event so
+// the debug overlay panel stays live without polling.
+// ---------------------------------------------------------------------------
+export interface RuntimeDebugState {
+  isLive: boolean;
+  /** Human-readable activity label: 'ACTIVE' | 'IDLE' */
+  label: string;
+  debugEnabled: boolean;
+  lastRuntimeSignal: string;
+  lastRuntimeSignalConfidence: string;
+  lastCopilotCommand: string;
+  lastEventRaw: string;
+  recentEvents: string[];
+  /** Most recently observed model name */
+  activeModel: string;
+  updatedAt: number;
+}
+
+// ---------------------------------------------------------------------------
 // Event bus contract.
 // ---------------------------------------------------------------------------
 export interface BurnSightEvents {
@@ -361,5 +382,18 @@ export interface BurnSightEvents {
   /** Fired to push payload to overlay webview consumers */
   'ui.webviewUpdate': OverlaySnapshot;
   /** Fired to push payload to status bar consumers */
-  'statusbar.update': OverlaySnapshot;
+  'statusbar.update': { estimatedTotalCostUsd: number; isActive: boolean };
+  // ---- New domain-level events (architecture v3) ---------------------------
+  /** Fired by GitHubCopilotAdapter for each normalized signal */
+  'signal.raw': import('../domain/RawSignal').RawSignal;
+  /** Fired by CorrelationEngine when a trace is finalized */
+  'trace.completed': {
+    trace: import('../domain/InteractionTrace').InteractionTrace;
+    signal: import('../domain/RawSignal').RawSignal;
+  };
+  /** Fired by SessionStore after every trace append — primary UI event */
+  'session.updated': {
+    session: import('../domain/SessionTelemetry').SessionTelemetry;
+    runtime: RuntimeDebugState;
+  };
 }

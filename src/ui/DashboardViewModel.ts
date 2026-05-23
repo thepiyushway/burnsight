@@ -1,4 +1,5 @@
-import { OverlaySnapshot, TelemetryState } from '../telemetry/types';
+import { OverlaySnapshot, RuntimeDebugState, TelemetryState } from '../telemetry/types';
+import { SessionTelemetry } from '../domain/SessionTelemetry';
 
 export interface DashboardModelSpendRow {
   model: string;
@@ -17,7 +18,21 @@ export interface DashboardViewModel {
   runtimeLabel: string;
   isLive: boolean;
   debugEnabled: boolean;
+  // --- Legacy field (kept for overlay compatibility)
   totalRequests: number;
+  // --- Semantic counters (Phase 2: Session Intelligence)
+  /** Number of distinct user interactions this session */
+  interactions: number;
+  /** Total internal operations (spans) across all interactions */
+  internalOperations: number;
+  /** Orchestration overhead as a percentage 0–100 */
+  orchestrationOverheadPct: number;
+  /** Number of hidden-inference spans across this session */
+  hiddenInferenceCount: number;
+  /** The workflow responsible for most cost this session */
+  dominantWorkflow: string;
+  /** Confidence label for cost estimates */
+  confidenceLabel: string;
   estimatedSessionCostUsd: number;
   estimatedInputTokens: number;
   estimatedOutputTokens: number;
@@ -107,6 +122,13 @@ export function createDashboardViewModel(input: {
     sessionDurationMs:
       state.sessionStartedAt !== null ? Math.max(0, updatedAt - state.sessionStartedAt) : 0,
     updatedAt,
+    // Semantic Phase 2 fields — not available in legacy path
+    interactions: state.requestCount,
+    internalOperations: state.requestCount,
+    orchestrationOverheadPct: 0,
+    hiddenInferenceCount: 0,
+    dominantWorkflow: getMostUsed(state.requestsByFeature),
+    confidenceLabel: 'Estimated',
     debug: {
       lastRuntimeSignal: snapshot.debug.lastRuntimeSignal,
       lastRuntimeSignalConfidence: snapshot.debug.lastRuntimeSignalConfidence,
@@ -132,4 +154,107 @@ function formatDistribution(counts: Record<string, number>, totalRequests: numbe
     .slice(0, 3)
     .map(([model, count]) => `${model}:${Math.round((count / totalRequests) * 100)}%`)
     .join(' | ');
+}
+
+// ---------------------------------------------------------------------------
+// v3 domain-based factory — primary path for arch v3 pipeline.
+// Derives DashboardViewModel from SessionTelemetry + RuntimeDebugState without
+// touching raw logs.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a DashboardViewModel from new domain types.
+ * This is the primary factory for the v3 architecture.
+ */
+export function createDashboardViewModelFromSession(
+  session: SessionTelemetry,
+  runtime: RuntimeDebugState,
+): DashboardViewModel {
+  const agg = session.aggregateMetrics;
+  const now = Date.now();
+
+  const modelSpendRows: DashboardModelSpendRow[] = Object.entries(agg.modelBreakdown)
+    .sort(([, a], [, b]) => b.estimatedCostUsd - a.estimatedCostUsd)
+    .map(([model, m]) => ({
+      model,
+      requests: m.requestCount,
+      spendUsd: m.estimatedCostUsd,
+    }));
+
+  const workflowSpendRows: DashboardWorkflowSpendRow[] = Object.entries(
+    agg.workflowBreakdown,
+  )
+    .sort(([, a], [, b]) => b.estimatedCostUsd - a.estimatedCostUsd)
+    .map(([workflow, w]) => ({
+      workflow,
+      requests: w.requestCount,
+      spendUsd: w.estimatedCostUsd,
+    }));
+
+  const requestsByModel = Object.fromEntries(
+    Object.entries(agg.modelBreakdown).map(([k, v]) => [k, v.requestCount]),
+  );
+  const spendByModel = Object.fromEntries(
+    Object.entries(agg.modelBreakdown).map(([k, v]) => [k, v.estimatedCostUsd]),
+  );
+  const requestsByWorkflow = Object.fromEntries(
+    Object.entries(agg.workflowBreakdown).map(([k, v]) => [k, v.requestCount]),
+  );
+  const spendByWorkflow = Object.fromEntries(
+    Object.entries(agg.workflowBreakdown).map(([k, v]) => [k, v.estimatedCostUsd]),
+  );
+
+  const mostUsedModel = getMostUsed(requestsByModel);
+  const mostExpensiveModel = getMostUsed(spendByModel);
+  const topWorkflow = getMostUsed(requestsByWorkflow);
+
+  return {
+    version: 'v3',
+    runtimeLabel: runtime.label,
+    isLive: runtime.isLive,
+    debugEnabled: runtime.debugEnabled,
+    totalRequests: agg.totalInteractions,
+    estimatedSessionCostUsd: agg.estimatedTotalCostUsd,
+    estimatedInputTokens: agg.estimatedTotalInputTokens,
+    estimatedOutputTokens: agg.estimatedTotalOutputTokens,
+    estimatedTotalTokens: agg.estimatedTotalInputTokens + agg.estimatedTotalOutputTokens,
+    averageLatencyMs: agg.averageLatencyMs,
+    retries: agg.retryCount,
+    escalations: agg.escalationCount,
+    activeModels: Object.keys(agg.modelBreakdown),
+    activeModel: runtime.activeModel || mostUsedModel || 'none',
+    requestsByModel,
+    spendByModel,
+    requestsByWorkflow,
+    spendByWorkflow,
+    modelSpendRows,
+    workflowSpendRows,
+    mostUsedModel,
+    mostExpensiveModel,
+    topWorkflow,
+    retryCostSharePct: Math.round(agg.retryCostPercentage),
+    requestDistribution: formatDistribution(requestsByModel, agg.totalInteractions),
+    sessionArtifacts: 0,
+    averageRequestCostUsd:
+      agg.totalInteractions > 0
+        ? agg.estimatedTotalCostUsd / agg.totalInteractions
+        : 0,
+    estimatedBurnRateUsdPerHour: agg.estimatedBurnRatePerHour,
+    sessionDurationMs: Math.max(0, now - session.startedAt),
+    updatedAt: runtime.updatedAt,
+    // Semantic Phase 2 fields
+    interactions: agg.totalInteractions,
+    internalOperations: agg.totalInternalOperations,
+    orchestrationOverheadPct: Math.round(agg.orchestrationOverheadRatio * 100),
+    hiddenInferenceCount: agg.hiddenInferenceCount,
+    dominantWorkflow: topWorkflow || 'unknown',
+    confidenceLabel: String(agg.confidence),
+    debug: {
+      lastRuntimeSignal: runtime.lastRuntimeSignal,
+      lastRuntimeSignalConfidence: runtime.lastRuntimeSignalConfidence,
+      lastCopilotCommand: runtime.lastCopilotCommand,
+      lastEventRaw: runtime.lastEventRaw,
+      recentEvents: runtime.recentEvents,
+    },
+  };
 }

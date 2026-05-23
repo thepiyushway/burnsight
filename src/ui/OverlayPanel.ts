@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { BurnSightEvents } from '../telemetry/types';
 import { EventBus } from '../utils/EventBus';
 import { getOverlayHtml } from './template';
-import { createDashboardViewModel, DashboardViewModel } from './DashboardViewModel';
+import { createDashboardViewModelFromSession, DashboardViewModel } from './DashboardViewModel';
 
 export class OverlayPanel implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
@@ -19,14 +19,10 @@ export class OverlayPanel implements vscode.Disposable {
     private readonly log: vscode.LogOutputChannel
   ) {
     this.subscriptions.push(
-      this.bus.on('telemetry.updated', (payload) => {
-        this.log.info('[STATE] telemetry state changed');
+      this.bus.on('session.updated', ({ session, runtime }) => {
+        this.log.info('[STATE] session updated');
         this.publishDashboardUpdate(
-          createDashboardViewModel({
-            state: payload.state,
-            snapshot: payload.snapshot,
-            updatedAt: payload.event.timestamp,
-          })
+          createDashboardViewModelFromSession(session, runtime)
         );
       })
     );

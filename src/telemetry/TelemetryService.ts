@@ -1,132 +1,107 @@
 import * as vscode from 'vscode';
 import {
   BurnSightEvents,
-  ConfidenceLevel,
-  CopilotLogEvent,
-  DerivedMetric,
-  OverlaySnapshot,
-  RequestLifecycleState,
-  RuntimeSignal,
+  RuntimeDebugState,
   SessionState,
-  SessionTimelineEvent,
-  TelemetryState,
 } from './types';
 import { EventBus } from '../utils/EventBus';
-import {
-  formatApproxCurrency,
-  formatCurrency,
-  formatInteger,
-  formatRate,
-  formatTokenCount,
-} from '../utils/formatters';
-import { TelemetryStateStore } from '../state/TelemetryStateStore';
-import { NormalizedEventParser } from '../services/normalizedEventParser';
-import { EventDeduper } from '../services/eventDeduper';
-import { EconomicsEnricher } from '../services/economicsEnricher';
-import { SessionAggregator } from '../services/sessionAggregator';
-import { AIEconomicEvent } from '../types/aiTelemetry';
+import { SessionStore } from '../store/SessionStore';
+import { CorrelationEngine } from '../correlation/CorrelationEngine';
+import { EconomicsEngine } from '../economics/EconomicsEngine';
+import { GitHubCopilotAdapter } from '../adapters/GitHubCopilotAdapter';
+import { SessionTelemetry } from '../domain/SessionTelemetry';
+import { TraceClassifier } from '../classification/TraceClassifier';
+import { EconomicsCalibrator } from '../economics/EconomicsCalibrator';
+import { formatCurrency } from '../utils/formatters';
 
-const VERSION = 'v2.1.0-accounting';
+const VERSION = 'v3.0.0-domain';
 const IDLE_AFTER_MS = 5 * 60 * 1000;
 const MAX_RECENT_EVENTS = 50;
-const MAX_TIMELINE_EVENTS = 250;
-const MAX_LIFECYCLE_HISTORY = 1000;
 const WEBVIEW_UPDATE_DEBOUNCE_MS = 120;
 
 /**
- * TelemetryService is the singleton runtime telemetry authority for BurnSight.
+ * BurnSight runtime orchestrator.
  *
- * Methodology summary:
- * - Accounting happens only on completed request boundaries.
- * - Deduplication is enforced by processedRequestIds.
- * - Economic fields remain undefined until real token telemetry is available.
+ * Owns the full signal-to-session pipeline:
+ *
+ *   CopilotLogParser  ──copilot.request──►  GitHubCopilotAdapter
+ *                                                   │ RawSignal
+ *                                                   ▼
+ *                                          CorrelationEngine
+ *                                                   │ InteractionTrace
+ *                                                   ▼
+ *                                           EconomicsEngine
+ *                                                   │ enriched trace
+ *                                                   ▼
+ *                                            SessionStore
+ *                                                   │ session.updated
+ *                                                   ▼
+ *                                         OverlayPanel / status bar
+ *
+ * The TelemetryService also tracks ephemeral RuntimeDebugState for the
+ * debug overlay panel and manages the ACTIVE/IDLE state machine.
+ *
+ * Singleton: use TelemetryService.initialize(bus, log, context).
  */
 export class TelemetryService implements vscode.Disposable {
   private static instance: TelemetryService | undefined;
 
   private readonly subscriptions: vscode.Disposable[] = [];
-  private readonly stateStore: TelemetryStateStore;
+  private readonly sessionStore: SessionStore;
+  private readonly correlationEngine: CorrelationEngine;
+  private readonly economicsEngine = new EconomicsEngine();
+  private readonly traceClassifier = new TraceClassifier();
+  private readonly economicsCalibrator = new EconomicsCalibrator();
+  private readonly copilotAdapter: GitHubCopilotAdapter;
 
-  private state: TelemetryState;
+  // Ephemeral debug / runtime state
   private sessionState: SessionState = SessionState.IDLE;
-  private latestSnapshot: OverlaySnapshot;
-  private idleTimer: NodeJS.Timeout | undefined;
-
   private debugEnabled = false;
-  private lastRuntimeSignal: RuntimeSignal['type'] | 'none' = 'none';
+  private lastRuntimeSignal: string = 'none';
   private lastRuntimeSignalConfidence = 0;
   private lastCopilotCommand = 'none';
+  private lastEventRaw = '';
+  private recentEvents: string[] = [];
+  private activeModel = '';
+
+  private idleTimer: NodeJS.Timeout | undefined;
   private webviewDebounceTimer: NodeJS.Timeout | undefined;
-  private readonly normalizedEventParser = new NormalizedEventParser();
-  private readonly eventDeduper = new EventDeduper();
-  private readonly economicsEnricher = new EconomicsEnricher();
-  private readonly sessionAggregator = new SessionAggregator();
 
   private constructor(
     private readonly bus: EventBus<BurnSightEvents>,
     private readonly log: vscode.LogOutputChannel,
-    stateStore?: TelemetryStateStore
+    context: vscode.ExtensionContext,
   ) {
-    this.stateStore = stateStore ?? new TelemetryStateStore(TelemetryService.createEmptyState());
-    this.state = this.stateStore.get();
-    if (this.state.sessionStartedAt === null) {
-      this.state = this.stateStore.update((prev) => ({
-        ...prev,
-        sessionStartedAt: Date.now(),
-      }));
-      this.log.info(`[SESSION] live session started at activation: ${this.state.sessionStartedAt}`);
-    }
-    this.latestSnapshot = this.buildSnapshot();
+    this.sessionStore = new SessionStore(context, log);
+    this.correlationEngine = new CorrelationEngine(
+      this.sessionStore.getSession().sessionId,
+    );
+    this.copilotAdapter = new GitHubCopilotAdapter(bus, log);
 
+    this.wirePipeline();
+    this.subscribeRuntimeEvents();
     this.readDebugConfiguration();
+
     this.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration('burnsight.debugTelemetry')) {
           this.readDebugConfiguration();
         }
-      })
-    );
-
-    this.subscriptions.push(
-      this.bus.on('copilot.request', (event) => {
-        this.ingestRuntimeEvent(event);
-      })
-    );
-
-    this.subscriptions.push(
-      this.bus.on('runtime.signal', (signal) => {
-        this.lastRuntimeSignal = signal.type;
-        this.lastRuntimeSignalConfidence = signal.confidence;
-        if (!this.debugEnabled) {
-          return;
-        }
-        this.latestSnapshot = this.buildSnapshot();
-        this.emitTelemetryAndWebview();
-      })
-    );
-
-    this.subscriptions.push(
-      this.bus.on('runtime.command', (event) => {
-        if (!event.isCopilotRelated) {
-          return;
-        }
-        this.lastCopilotCommand = event.command;
-        if (!this.debugEnabled) {
-          return;
-        }
-        this.latestSnapshot = this.buildSnapshot();
-        this.emitTelemetryAndWebview();
-      })
+      }),
     );
   }
+
+  // --------------------------------------------------------------------------
+  // Static factory
+  // --------------------------------------------------------------------------
 
   public static initialize(
     bus: EventBus<BurnSightEvents>,
     log: vscode.LogOutputChannel,
-    stateStore?: TelemetryStateStore
+    context: vscode.ExtensionContext,
   ): TelemetryService {
     if (!TelemetryService.instance) {
-      TelemetryService.instance = new TelemetryService(bus, log, stateStore);
+      TelemetryService.instance = new TelemetryService(bus, log, context);
     }
     return TelemetryService.instance;
   }
@@ -138,12 +113,16 @@ export class TelemetryService implements vscode.Disposable {
     return TelemetryService.instance;
   }
 
-  public getSnapshot(): OverlaySnapshot {
-    return this.latestSnapshot;
+  // --------------------------------------------------------------------------
+  // Public accessors
+  // --------------------------------------------------------------------------
+
+  public getSession(): SessionTelemetry {
+    return this.sessionStore.getSession();
   }
 
-  public onSnapshot(listener: (snapshot: OverlaySnapshot) => void): vscode.Disposable {
-    return this.bus.on('telemetry.snapshot', listener);
+  public getRuntimeDebugState(): RuntimeDebugState {
+    return this.buildRuntimeDebugState();
   }
 
   public dispose(): void {
@@ -153,660 +132,246 @@ export class TelemetryService implements vscode.Disposable {
     if (this.webviewDebounceTimer) {
       clearTimeout(this.webviewDebounceTimer);
     }
+    void this.copilotAdapter.stop();
     vscode.Disposable.from(...this.subscriptions).dispose();
+    this.sessionStore.dispose();
     if (TelemetryService.instance === this) {
       TelemetryService.instance = undefined;
     }
   }
 
-  private readDebugConfiguration(): void {
-    this.debugEnabled = vscode.workspace
-      .getConfiguration('burnsight')
-      .get<boolean>('debugTelemetry', false);
+  // --------------------------------------------------------------------------
+  // Pipeline wiring
+  // --------------------------------------------------------------------------
 
-    if (this.debugEnabled) {
-      this.log.info('[TelemetryService] Debug telemetry logging enabled');
-      this.log.show(true);
-    }
-  }
+  private wirePipeline(): void {
+    // 1. Start the adapter (subscribes to copilot.request on the bus)
+    void this.copilotAdapter.start();
 
-  private ingestRuntimeEvent(event: CopilotLogEvent): void {
-    this.log.info(
-      `[EVENT] received copilot.request requestId=${event.requestId} source=${event.sourceFile ?? 'unknown'} stage=${event.stage}`
-    );
-
-    const sourcePath = (event.sourceFile ?? '').toLowerCase();
-    if (sourcePath.includes('burnsight')) {
-      this.log.warn('[TelemetryService] ingestion aborted: self-source detected (burnsight)');
-      return;
-    }
-
-    const normalized = this.normalizedEventParser.parse({
-      rawLine: event.rawLine,
-      timestamp: event.timestamp,
-      sourceFile: event.sourceFile ?? 'unknown',
-      fileOffset: event.fileOffset,
+    // 2. Adapter signal → CorrelationEngine
+    const adapterDisposable = this.copilotAdapter.onSignal((signal) => {
+      this.log.info(
+        `[Pipeline] signal type=${signal.type} requestId=${signal.requestId ?? 'orphan'} model=${signal.model ?? 'unknown'}`,
+      );
+      this.bus.emit('signal.raw', signal);
+      this.correlationEngine.ingest(signal);
     });
-    if (!normalized) {
-      this.log.info(`[EVENT] dropped before normalization requestId=${event.requestId}`);
-      return;
-    }
+    this.subscriptions.push(new vscode.Disposable(() => adapterDisposable.dispose()));
 
-    this.log.info(
-      `[EVENT] normalized requestId=${normalized.requestId} model=${normalized.model} feature=${normalized.feature}`
-    );
+    // 3. CorrelationEngine → EconomicsEngine → SessionStore
+    const traceDisposable = this.correlationEngine.onTraceCompleted((trace, endSignal) => {
+      this.log.info(
+        `[Pipeline] trace completed traceId=${trace.traceId} spans=${trace.spans.length} models=${trace.modelsUsed.join(',')}`,
+      );
 
-    this.log.info(
-      `[PARSER] parsed requestId=${normalized.requestId} model=${normalized.model} latency=${normalized.latencyMs} feature=${normalized.feature}`
-    );
+      const enrichedTrace = this.economicsEngine.enrichTrace(trace, endSignal);
 
-    if (!this.eventDeduper.shouldProcess(normalized)) {
-      this.log.info(`[DEDUPE] skipped duplicate requestId=${normalized.requestId}`);
-      return;
-    }
+      // Semantic classification: attach span categories and InteractionSemantics
+      const classifiedTrace = this.traceClassifier.classify(enrichedTrace);
 
-    const enriched = this.economicsEnricher.enrich(normalized);
-    this.log.info(
-      `[TOKEN-EST] request=${enriched.requestId} input=${enriched.estimatedInputTokens} output=${enriched.estimatedOutputTokens}`
-    );
-    this.log.info(
-      `[COST-EST] request=${enriched.requestId} estimatedCost=${formatCurrency(enriched.estimatedCostUsd)}`
-    );
-    this.log.info(
-      `[WORKFLOW] request=${enriched.requestId} feature=${enriched.feature} orchestration=${enriched.orchestrationAmplification.toFixed(2)}x`
-    );
-    if (enriched.escalationCount && enriched.escalationCount > 0) {
-      const from = enriched.routedFromModel ?? 'unknown';
-      this.log.info(`[ESCALATION] ${from} -> ${enriched.model} count=${enriched.escalationCount}`);
-    }
-    if (enriched.retryAmplification > 1) {
-      this.log.info(`[RETRY] retry amplification=${enriched.retryAmplification.toFixed(2)}x`);
-    }
-    this.log.info(
-      `[ECONOMICS] ${enriched.pricingAvailable ? `pricing found model=${enriched.model}` : `pricing missing model=${enriched.model}`}`
-    );
+      // Economics calibration: deflate infrastructure/retry spans to believable estimates
+      const calibratedTrace = this.economicsCalibrator.calibrate(classifiedTrace);
 
-    const previousSessionState = this.sessionState;
-    let accountedRequest = false;
+      this.log.info(
+        `[Pipeline] enriched traceId=${calibratedTrace.traceId} cost=${formatCurrency(calibratedTrace.estimatedCostUsd)} input=${calibratedTrace.estimatedInputTokens} output=${calibratedTrace.estimatedOutputTokens} spans=${calibratedTrace.spans.length} interactions=${calibratedTrace.semantics ? 1 : 0}`,
+      );
 
-    this.state = this.stateStore.update((prev) => {
-      const next: TelemetryState = { ...prev };
-      const now = event.timestamp;
-      next.lastActivityAt = now;
-      next.observedCharCount += event.observedChars;
+      this.bus.emit('trace.completed', { trace: calibratedTrace, signal: endSignal });
 
-      if (event.sessionArtifact && !next.sessionArtifacts.includes(event.sessionArtifact)) {
-        next.sessionArtifacts = [...next.sessionArtifacts, event.sessionArtifact];
+      // Track active model for debug overlay
+      if (calibratedTrace.modelsUsed.length > 0) {
+        this.activeModel = calibratedTrace.modelsUsed[calibratedTrace.modelsUsed.length - 1];
       }
 
-      next.activeModel = enriched.model;
-      if (!next.modelHistory.includes(enriched.model)) {
-        next.modelHistory = [...next.modelHistory, enriched.model];
-      }
+      // Transition to ACTIVE and schedule idle
+      const previousSessionState = this.sessionState;
+      this.sessionState = SessionState.ACTIVE;
+      this.scheduleIdleTransition(endSignal.timestamp);
 
-      const lifecycle = this.upsertLifecycle(next, enriched.requestId, event, enriched);
-
-      if (lifecycle.firstSeenAt === now && !lifecycle.accounted) {
-        next.timeline = this.appendTimeline(next.timeline, {
-          requestId: lifecycle.requestId,
-          phase: 'request_start',
-          model: lifecycle.model ?? enriched.model,
-          sourceType: lifecycle.sourceType ?? enriched.feature,
-          latencyMs: 0,
-          success: false,
-          estimatedCostUsd: 0,
-          timestamp: now,
-          rawLine: enriched.rawLine,
+      if (previousSessionState !== this.sessionState) {
+        this.bus.emit('session.stateChanged', {
+          previous: previousSessionState,
+          current: this.sessionState,
         });
       }
 
-      if (next.processedRequestIds[enriched.requestId]) {
-        this.log.info(`[DEDUPE] skipped duplicate requestId=${enriched.requestId}`);
-        next.recentEvents = [event, ...next.recentEvents].slice(0, MAX_RECENT_EVENTS);
-        return next;
-      }
-
-      lifecycle.seenRequestDone = true;
-      lifecycle.completedAt = now;
-      lifecycle.accounted = true;
-      lifecycle.success = enriched.status === 'success';
-
-      const sessionMetrics = this.sessionAggregator.consume(enriched);
-      next.requestCount = sessionMetrics.totalRequests;
-      next.successCount = sessionMetrics.successCount;
-      next.cancelledCount = sessionMetrics.cancelledCount;
-      next.errorCount = sessionMetrics.errorCount;
-      next.totalLatencyMs = sessionMetrics.totalLatencyMs;
-      next.averageLatencyMs = sessionMetrics.averageLatencyMs;
-      next.requestsByFeature = { ...sessionMetrics.requestsByFeature };
-      next.modelRequestCounts = { ...sessionMetrics.requestsByModel };
-      next.retryRequests = sessionMetrics.retryRequests;
-      next.escalationCount = sessionMetrics.escalationCount;
-
-      next.estimatedInputTokens = sessionMetrics.estimatedTotalInputTokens;
-      next.estimatedOutputTokens = sessionMetrics.estimatedTotalOutputTokens;
-      next.estimatedTotalTokens = sessionMetrics.estimatedTotalTokens;
-      next.estimatedTotalCost = sessionMetrics.estimatedTotalCostUsd;
-      next.estimatedBurnRatePerHour = sessionMetrics.estimatedBurnRatePerHour;
-      next.modelCosts = { ...sessionMetrics.modelCostUsd };
-      next.workflowCosts = { ...sessionMetrics.workflowCostUsd };
-      next.workflowTokens = { ...sessionMetrics.workflowTokenUsage };
-      next.retryAmplificationCost = sessionMetrics.retryAmplificationCostUsd;
-      next.retryCostPercentage = sessionMetrics.retryCostPercentage;
-
-      const nextModelTokens = { ...next.modelTokens };
-      nextModelTokens[enriched.model] = {
-        input: (nextModelTokens[enriched.model]?.input ?? 0) + enriched.estimatedInputTokens,
-        output: (nextModelTokens[enriched.model]?.output ?? 0) + enriched.estimatedOutputTokens,
-      };
-      next.modelTokens = nextModelTokens;
-
-      next.latencies = [...next.latencies, enriched.latencyMs];
-      next.modelLatencyStats = {
-        ...next.modelLatencyStats,
-        [enriched.model]: {
-          totalMs: (next.modelLatencyStats[enriched.model]?.totalMs ?? 0) + enriched.latencyMs,
-          count: (next.modelLatencyStats[enriched.model]?.count ?? 0) + 1,
-        },
-      };
-
-      next.processedRequestIds = {
-        ...next.processedRequestIds,
-        [enriched.requestId]: true,
-      };
-
-      next.timeline = this.appendTimeline(next.timeline, {
-        requestId: enriched.requestId,
-        phase: 'request_complete',
-        model: enriched.model,
-        sourceType: enriched.feature,
-        latencyMs: enriched.latencyMs,
-        success: enriched.status === 'success',
-        estimatedCostUsd: enriched.estimatedCostUsd ?? 0,
-        timestamp: now,
-        rawLine: enriched.rawLine,
-      });
-      next.recentEvents = [event, ...next.recentEvents].slice(0, MAX_RECENT_EVENTS);
-
-      accountedRequest = true;
-      return next;
+      // Persist — triggers session.updated listener below
+      this.sessionStore.appendTrace(calibratedTrace);
     });
+    this.subscriptions.push(new vscode.Disposable(() => traceDisposable.dispose()));
 
-    this.sessionState = SessionState.ACTIVE;
-    this.scheduleIdleTransition(event.timestamp);
-    this.latestSnapshot = this.buildSnapshot();
+    // 4. SessionStore → bus events
+    const storeDisposable = this.sessionStore.onSessionUpdated((session) => {
+      const runtime = this.buildRuntimeDebugState();
+      this.log.info(
+        `[Pipeline] session updated id=${session.sessionId} traces=${session.interactions.length} totalCost=${formatCurrency(session.aggregateMetrics.estimatedTotalCostUsd)}`,
+      );
 
-    if (previousSessionState !== this.sessionState) {
-      this.bus.emit('session.stateChanged', {
-        previous: previousSessionState,
-        current: this.sessionState,
+      this.bus.emit('session.updated', { session, runtime });
+      this.bus.emit('statusbar.update', {
+        estimatedTotalCostUsd: session.aggregateMetrics.estimatedTotalCostUsd,
+        isActive: this.sessionState === SessionState.ACTIVE,
       });
-    }
 
-    if (accountedRequest) {
-      this.log.info(`[ACCOUNTING] request incremented model=${this.state.activeModel} total=${this.state.requestCount}`);
-      this.log.info(`[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests} estCost=${formatCurrency(this.state.estimatedTotalCost)} estTokens=${Math.round(this.state.estimatedTotalTokens)}`);
-    }
-
-    this.bus.emit('telemetry.updated', {
-      event,
-      state: this.state,
-      snapshot: this.latestSnapshot,
+      this.scheduleWebviewDebounce(session, runtime);
     });
-
-    this.emitSnapshotChannels(accountedRequest);
+    this.subscriptions.push(new vscode.Disposable(() => storeDisposable.dispose()));
   }
 
-  private upsertLifecycle(
-    state: TelemetryState,
-    requestId: string,
-    event: CopilotLogEvent,
-    normalized?: AIEconomicEvent
-  ): RequestLifecycleState {
-    const existing = state.lifecycleByRequestId[requestId];
-    const lifecycle: RequestLifecycleState = existing
-      ? {
-          ...existing,
-          lastSeenAt: event.timestamp,
-          accumulatedChars: existing.accumulatedChars + event.observedChars,
+  // --------------------------------------------------------------------------
+  // Runtime event subscriptions (debug / idle / commands)
+  // --------------------------------------------------------------------------
+
+  private subscribeRuntimeEvents(): void {
+    this.subscriptions.push(
+      this.bus.on('runtime.signal', (signal) => {
+        this.lastRuntimeSignal = signal.type;
+        this.lastRuntimeSignalConfidence = signal.confidence;
+        if (this.debugEnabled) {
+          this.emitDebugUpdate();
         }
-      : {
-          requestId,
-          firstSeenAt: event.timestamp,
-          lastSeenAt: event.timestamp,
-          accumulatedChars: event.observedChars,
-          seenRequestDone: false,
-          accounted: false,
-        };
+      }),
+    );
 
-    if (normalized?.model ?? event.model) {
-      lifecycle.model = normalized?.model ?? event.model;
-    }
-    if (normalized?.latencyMs !== undefined || event.latencyMs !== undefined) {
-      lifecycle.latencyMs = normalized?.latencyMs ?? event.latencyMs;
-    }
-    if (event.finishReason) {
-      lifecycle.finishReason = event.finishReason;
-    }
-    if (event.sessionArtifact) {
-      lifecycle.sessionArtifact = event.sessionArtifact;
-    }
-    if (event.provider) {
-      lifecycle.provider = event.provider;
-    }
-    if (normalized?.feature ?? event.sourceType) {
-      lifecycle.sourceType = normalized?.feature ?? event.sourceType;
-    }
-    if (normalized?.status) {
-      lifecycle.success = normalized.status === 'success';
-    } else if (event.success !== undefined) {
-      lifecycle.success = event.success;
-    }
-    if (event.requestDone) {
-      lifecycle.seenRequestDone = true;
-    }
+    this.subscriptions.push(
+      this.bus.on('runtime.command', (event) => {
+        if (!event.isCopilotRelated) {
+          return;
+        }
+        this.lastCopilotCommand = event.command;
+        if (this.debugEnabled) {
+          this.emitDebugUpdate();
+        }
+      }),
+    );
 
-    const lifecycleByRequestId = {
-      ...state.lifecycleByRequestId,
-      [requestId]: lifecycle,
-    };
-
-    const keys = Object.keys(lifecycleByRequestId);
-    if (keys.length > MAX_LIFECYCLE_HISTORY) {
-      keys
-        .sort(
-          (left, right) =>
-            lifecycleByRequestId[left].lastSeenAt - lifecycleByRequestId[right].lastSeenAt
-        )
-        .slice(0, keys.length - MAX_LIFECYCLE_HISTORY)
-        .forEach((key) => {
-          delete lifecycleByRequestId[key];
-        });
-    }
-
-    state.lifecycleByRequestId = lifecycleByRequestId;
-    return lifecycle;
+    // Capture recent events for debug panel from the raw copilot.request stream
+    this.subscriptions.push(
+      this.bus.on('copilot.request', (event) => {
+        this.lastEventRaw = event.raw.slice(0, 200);
+        this.recentEvents = [this.lastEventRaw, ...this.recentEvents].slice(
+          0,
+          MAX_RECENT_EVENTS,
+        );
+      }),
+    );
   }
 
-  private appendTimeline(
-    timeline: SessionTimelineEvent[],
-    event: SessionTimelineEvent
-  ): SessionTimelineEvent[] {
-    return [...timeline, event].slice(-MAX_TIMELINE_EVENTS);
-  }
+  // --------------------------------------------------------------------------
+  // Idle state machine
+  // --------------------------------------------------------------------------
 
   private scheduleIdleTransition(lastActivityAt: number): void {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
     }
-
     this.idleTimer = setTimeout(() => {
       if (Date.now() - lastActivityAt < IDLE_AFTER_MS) {
         return;
       }
-
       const previous = this.sessionState;
       this.sessionState = SessionState.IDLE;
-      this.latestSnapshot = this.buildSnapshot();
-
       if (previous !== this.sessionState) {
         this.bus.emit('session.stateChanged', {
           previous,
           current: this.sessionState,
         });
+        this.bus.emit('statusbar.update', {
+          estimatedTotalCostUsd:
+            this.sessionStore.getSession().aggregateMetrics.estimatedTotalCostUsd,
+          isActive: false,
+        });
       }
-
-      this.emitTelemetryAndWebview();
     }, IDLE_AFTER_MS);
   }
 
-  private emitSnapshotChannels(includeStatusBarUpdate: boolean): void {
-    this.bus.emit('telemetry.snapshot', this.latestSnapshot);
-    this.scheduleWebviewUpdate();
-    if (includeStatusBarUpdate) {
-      this.bus.emit('statusbar.update', this.latestSnapshot);
-    }
-  }
+  // --------------------------------------------------------------------------
+  // Debounced webview update (legacy ui.webviewUpdate consumers)
+  // --------------------------------------------------------------------------
 
-  private emitTelemetryAndWebview(): void {
-    this.bus.emit('telemetry.snapshot', this.latestSnapshot);
-    this.scheduleWebviewUpdate();
-  }
-
-  private scheduleWebviewUpdate(): void {
+  private scheduleWebviewDebounce(
+    session: SessionTelemetry,
+    runtime: RuntimeDebugState,
+  ): void {
     if (this.webviewDebounceTimer) {
       clearTimeout(this.webviewDebounceTimer);
     }
-
     this.webviewDebounceTimer = setTimeout(() => {
-      this.bus.emit('ui.webviewUpdate', this.latestSnapshot);
+      this.webviewDebounceTimer = undefined;
+      this.bus.emit('ui.webviewUpdate', this.buildLegacyOverlaySnapshot(session, runtime));
     }, WEBVIEW_UPDATE_DEBOUNCE_MS);
   }
 
-  private buildSnapshot(): OverlaySnapshot {
-    const state = this.state;
-    const nowMs = Date.now();
-
-    const sessionDurationMs =
-      state.sessionStartedAt !== null ? Math.max(0, nowMs - state.sessionStartedAt) : 0;
-    const sessionDuration = formatDuration(sessionDurationMs);
-
-    const averageLatency = state.averageLatencyMs;
-    const avgRequestCost = state.requestCount > 0 ? state.estimatedTotalCost / state.requestCount : 0;
-
-    const modelRows: string[][] = state.requestCount > 0
-      ? state.modelHistory.map((modelName) => {
-          const modelRequests = state.modelRequestCounts[modelName] ?? 0;
-          const modelLatency = state.modelLatencyStats[modelName];
-          const avgModelLatency = modelLatency
-            ? Math.round(modelLatency.totalMs / Math.max(1, modelLatency.count))
-            : 0;
-          return [
-            modelName,
-            formatInteger(modelRequests),
-            `${avgModelLatency}ms`,
-            formatApproxCurrency(state.modelCosts[modelName] ?? 0),
-          ];
-        })
-      : [['—', '0', '0ms', '~$0.00']];
-
-    const workflowRows: string[][] = Object.keys(state.workflowCosts).length > 0
-      ? Object.entries(state.workflowCosts)
-          .sort((left, right) => right[1] - left[1])
-          .slice(0, 8)
-          .map(([workflow, cost]) => [
-            workflow,
-            formatApproxCurrency(cost),
-            formatTokenCount(
-              (state.workflowTokens[workflow]?.input ?? 0) +
-                (state.workflowTokens[workflow]?.output ?? 0)
-            ),
-          ])
-      : [['—', '~$0.00', '0 tokens']];
-
-    const finishReasonRows = Object.entries(state.finishReasons).length
-      ? Object.entries(state.finishReasons)
-          .sort((left, right) => right[1] - left[1])
-          .map(([reason, count]) => ({
-            label: reason,
-            value: formatInteger(count),
-          }))
-      : [{ label: 'no-data', value: '0' }];
-
-    const mostUsedModel = this.getMostUsedModel(state.modelRequestCounts);
-    const mostExpensiveModel = this.getMostExpensiveModel(state.modelCosts);
-    const topWorkflow = this.getMostUsedModel(state.requestsByFeature);
-    const distribution = this.formatModelDistribution(state.modelRequestCounts, state.requestCount);
-
-    const metrics: DerivedMetric[] = [
-      {
-        id: 'activeModel',
-        label: 'Active Model',
-        confidence: ConfidenceLevel.REAL,
-        value: state.activeModel || 'none',
-        formatted: state.activeModel || 'none',
-        notes: 'Directly observed from Copilot runtime logs.',
-      },
-      {
-        id: 'requestCount',
-        label: 'Request Count',
-        confidence: ConfidenceLevel.REAL,
-        value: state.requestCount,
-        formatted: formatInteger(state.requestCount),
-        notes: 'Counted once per requestId after completion accounting.',
-      },
-      {
-        id: 'sessionDuration',
-        label: 'Session Duration',
-        confidence: ConfidenceLevel.REAL,
-        value: sessionDurationMs,
-        formatted: sessionDuration,
-        notes: 'Elapsed wall-clock time since extension activation.',
-      },
-      {
-        id: 'averageLatency',
-        label: 'Average Latency',
-        confidence: ConfidenceLevel.REAL,
-        value: averageLatency,
-        formatted: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
-        notes: 'Average of observed/completed request latency values.',
-      },
-      {
-        id: 'estimatedTotalTokens',
-        label: 'Estimated Total Tokens',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedTotalTokens,
-        formatted: formatTokenCount(state.estimatedTotalTokens),
-        notes: 'Deterministic estimate from model/workflow/latency heuristics.',
-      },
-      {
-        id: 'estimatedCost',
-        label: 'Estimated Economics',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedTotalCost,
-        formatted: formatApproxCurrency(state.estimatedTotalCost),
-        notes: 'Estimated from token projection and pricing registry lookup.',
-      },
-      {
-        id: 'estimatedBurnRate',
-        label: 'Burn Velocity',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedBurnRatePerHour,
-        formatted: formatRate(state.estimatedBurnRatePerHour),
-        notes: 'Estimated hourly spend extrapolated from current session.',
-      },
-      {
-        id: 'averageRequestCost',
-        label: 'Avg Request Cost',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: avgRequestCost,
-        formatted: formatApproxCurrency(avgRequestCost),
-        notes: 'Estimated total spend divided by completed request count.',
-      },
-    ];
-
-    const recentEvents = state.recentEvents
-      .slice(0, 10)
-      .map((item) => `[${new Date(item.timestamp).toISOString().slice(11, 23)}] ${item.raw}`);
-
-    const timelineRows = state.timeline
-      .slice(-8)
-      .map((entry) => [
-        new Date(entry.timestamp).toISOString().slice(11, 19),
-        entry.phase,
-        entry.model,
-        entry.latencyMs > 0 ? `${entry.latencyMs}ms` : '—',
-        entry.estimatedCostUsd > 0 ? formatCurrency(entry.estimatedCostUsd) : '$0.00',
-      ]);
-
-    return {
-      title: 'BURNSIGHT_RUNTIME_OBSERVABILITY',
-      isLive: this.sessionState === SessionState.ACTIVE,
-      version: VERSION,
-      runtimeState: this.sessionState,
-      runtimeLabel: this.sessionState === SessionState.ACTIVE ? 'ACTIVE' : 'IDLE',
-      debug: {
-        enabled: this.debugEnabled,
-        activeModel: state.activeModel || 'none',
-        requestCount: formatInteger(state.requestCount),
-        avgLatencyMs: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
-        lastEventRaw: state.recentEvents[0]?.raw ?? 'none',
-        recentEvents,
-        lastRuntimeSignal: this.lastRuntimeSignal,
-        lastRuntimeSignalConfidence: `${Math.round(this.lastRuntimeSignalConfidence * 100)}%`,
-        lastCopilotCommand: this.lastCopilotCommand,
-      },
-      metrics,
-      cards: [
-        {
-          id: 'session',
-          kind: 'session',
-          title: 'SESSION ESTIMATED SPEND',
-          mainValue: formatApproxCurrency(state.estimatedTotalCost),
-          progressLabel: 'SESSION BURN',
-          progressValue: formatRate(state.estimatedBurnRatePerHour),
-          progressPct: state.requestCount > 0 ? Math.min(100, state.requestCount) : 0,
-          rows: [
-            {
-              label: 'ACTIVE MODEL',
-              value: state.activeModel || 'none',
-              accent: 'cyan',
-            },
-            {
-              label: 'EST. TOKENS',
-              value: formatTokenCount(state.estimatedTotalTokens),
-            },
-            {
-              label: 'SESSION DURATION',
-              value: sessionDuration,
-              accent: 'orange',
-            },
-          ],
-        },
-        {
-          id: 'models',
-          kind: 'table',
-          title: 'MODEL ANALYTICS (REAL + ESTIMATED)',
-          columns: ['MODEL', 'REQS', 'AVG LAT', 'EST. COST'],
-          rows: modelRows,
-        },
-        {
-          id: 'workflows',
-          kind: 'table',
-          title: 'WORKFLOW SPEND (ESTIMATED)',
-          columns: ['WORKFLOW', 'EST. COST', 'EST. TOKENS'],
-          rows: workflowRows,
-        },
-        {
-          id: 'model-insights',
-          kind: 'list',
-          title: 'WORKFLOW INSIGHTS',
-          tone: 'neutral',
-          rows: [
-            {
-              label: 'MOST USED MODEL',
-              value: mostUsedModel,
-            },
-            {
-              label: 'MOST EXPENSIVE MODEL',
-              value: mostExpensiveModel,
-              accent: 'cyan',
-            },
-            {
-              label: 'TOP WORKFLOW',
-              value: topWorkflow,
-              accent: 'orange',
-            },
-            {
-              label: 'RETRY COST SHARE',
-              value: `${Math.round(state.retryCostPercentage)}%`,
-            },
-          ],
-          footerLabel: 'REQUEST DISTRIBUTION',
-          footerValue: distribution,
-        },
-        {
-          id: 'lifecycle',
-          kind: 'list',
-          title: 'REQUEST LIFECYCLE (REAL)',
-          tone: 'ok',
-          rows: finishReasonRows,
-          footerLabel: 'SESSION ARTIFACTS',
-          footerValue: formatInteger(state.sessionArtifacts.length),
-        },
-        {
-          id: 'timeline',
-          kind: 'table',
-          title: 'SESSION TIMELINE',
-          columns: ['TIME', 'PHASE', 'MODEL', 'LAT', 'COST'],
-          rows: timelineRows.length > 0 ? timelineRows : [['—', '—', '—', '—', '$0.00']],
-        },
-      ],
-    };
+  /** Emit a live debug update without persisting a new trace. */
+  private emitDebugUpdate(): void {
+    const session = this.sessionStore.getSession();
+    const runtime = this.buildRuntimeDebugState();
+    this.bus.emit('session.updated', { session, runtime });
   }
 
-  private getMostUsedModel(counts: Record<string, number>): string {
-    const sorted = Object.entries(counts).sort((left, right) => right[1] - left[1]);
-    return sorted[0]?.[0] ?? 'none';
-  }
+  // --------------------------------------------------------------------------
+  // Configuration
+  // --------------------------------------------------------------------------
 
-  private getMostExpensiveModel(costs: Record<string, number>): string {
-    const sorted = Object.entries(costs).sort((left, right) => right[1] - left[1]);
-    return sorted[0]?.[0] ?? 'none';
-  }
-
-  private formatModelDistribution(
-    counts: Record<string, number>,
-    totalRequests: number
-  ): string {
-    if (totalRequests <= 0) {
-      return 'none';
+  private readDebugConfiguration(): void {
+    this.debugEnabled = vscode.workspace
+      .getConfiguration('burnsight')
+      .get<boolean>('debugTelemetry', false);
+    if (this.debugEnabled) {
+      this.log.info('[TelemetryService] debug telemetry enabled');
+      this.log.show(true);
     }
-
-    const parts = Object.entries(counts)
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 3)
-      .map(([model, count]) => `${model}:${Math.round((count / totalRequests) * 100)}%`);
-
-    return parts.join(' | ');
   }
 
-  public static createEmptyState(): TelemetryState {
+  // --------------------------------------------------------------------------
+  // State builders
+  // --------------------------------------------------------------------------
+
+  private buildRuntimeDebugState(): RuntimeDebugState {
     return {
-      sessionStartedAt: null,
-      lastActivityAt: 0,
-      requestCount: 0,
-      activeModel: '',
-      activeProvider: '',
-      modelHistory: [],
-      modelRequestCounts: {},
-      requestsByFeature: {},
-      latencies: [],
-      totalLatencyMs: 0,
-      averageLatencyMs: 0,
-      successCount: 0,
-      cancelledCount: 0,
-      errorCount: 0,
-      retryRequests: 0,
-      escalationCount: 0,
-      requestIds: [],
-      finishReasons: {},
-      sessionArtifacts: [],
-      processedRequestIds: {},
-      lifecycleByRequestId: {},
-      orphanRequestCounter: 0,
-      observedCharCount: 0,
-      contextAccumulatedChars: 0,
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedTotalTokens: 0,
-      estimatedContextTokens: 0,
-      modelTokens: {},
-      workflowTokens: {},
-      estimatedTotalCost: 0,
-      modelCosts: {},
-      workflowCosts: {},
-      estimatedBurnRatePerHour: 0,
-      retryAmplificationCost: 0,
-      retryCostPercentage: 0,
-      recentEvents: [],
-      timeline: [],
-      modelLatencyStats: {},
+      isLive: this.sessionState === SessionState.ACTIVE,
+      label: this.sessionState === SessionState.ACTIVE ? 'ACTIVE' : 'IDLE',
+      debugEnabled: this.debugEnabled,
+      lastRuntimeSignal: this.lastRuntimeSignal,
+      lastRuntimeSignalConfidence: `${(this.lastRuntimeSignalConfidence * 100).toFixed(0)}%`,
+      lastCopilotCommand: this.lastCopilotCommand,
+      lastEventRaw: this.lastEventRaw,
+      recentEvents: this.recentEvents.slice(),
+      activeModel: this.activeModel,
+      updatedAt: Date.now(),
     };
   }
-}
 
-function formatDuration(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m ${seconds}s`;
+  /**
+   * Builds a minimal OverlaySnapshot for legacy ui.webviewUpdate consumers.
+   * Used for backward compat during the arch v3 transition.
+   */
+  private buildLegacyOverlaySnapshot(
+    session: SessionTelemetry,
+    runtime: RuntimeDebugState,
+  ) {
+    return {
+      title: 'BurnSight',
+      isLive: runtime.isLive,
+      version: VERSION,
+      runtimeState:
+        this.sessionState === SessionState.ACTIVE
+          ? SessionState.ACTIVE
+          : SessionState.IDLE,
+      runtimeLabel: runtime.label,
+      debug: {
+        enabled: runtime.debugEnabled,
+        activeModel: runtime.activeModel,
+        requestCount: String(session.aggregateMetrics.totalInteractions),
+        avgLatencyMs: `${Math.round(session.aggregateMetrics.averageLatencyMs)}ms`,
+        lastEventRaw: runtime.lastEventRaw,
+        recentEvents: runtime.recentEvents,
+        lastRuntimeSignal: runtime.lastRuntimeSignal,
+        lastRuntimeSignalConfidence: runtime.lastRuntimeSignalConfidence,
+        lastCopilotCommand: runtime.lastCopilotCommand,
+      },
+      metrics: [],
+      cards: [],
+    };
   }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
-  return `${seconds}s`;
 }
