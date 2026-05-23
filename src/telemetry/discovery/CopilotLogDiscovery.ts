@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { TelemetrySourceClassifier } from './TelemetrySourceClassifier';
 
 export interface CopilotTelemetryFileMetadata {
   sourcePath: string;
@@ -18,21 +19,11 @@ interface ValidationCacheEntry {
 }
 
 const ALLOWED_EXTENSIONS = new Set(['.log', '.txt', '.copilotmd']);
-const TELEMETRY_SIGNATURES = [
-  'ccreq:',
-  'request done:',
-  'message 0 returned',
-  'copilotcli',
-  'copilotclichatsessioncontentprovider',
-  'conversationfeature',
-  'model deployment id',
-  'copilotmd',
-] as const;
-
 const DISCOVERY_SCAN_LINE_LIMIT = 200;
 const DISCOVERY_SCAN_BYTE_LIMIT = 512 * 1024;
 const RESCAN_INTERVAL_MS = 30_000;
 const FILE_CHANGE_DEBOUNCE_MS = 120;
+const SESSION_DIR_REGEX = /^\d{8}T\d{6}$/;
 
 export class CopilotLogDiscovery implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[] = [];
@@ -41,17 +32,12 @@ export class CopilotLogDiscovery implements vscode.Disposable {
   private readonly watcherByFile = new Map<string, vscode.FileSystemWatcher>();
   private readonly debounceTimers = new Map<string, NodeJS.Timeout>();
   private rescanTimer: NodeJS.Timeout | undefined;
+  private readonly sourceClassifier = new TelemetrySourceClassifier();
 
-  private readonly denylistTokens = [
-    'burnsight',
-    'telemetry',
-    'runtimeinspector',
-    'extension-output',
-    'output channels',
-    'outputchannel',
-  ] as const;
-
-  constructor(private readonly log: vscode.LogOutputChannel) {}
+  constructor(
+    private readonly log: vscode.LogOutputChannel,
+    private readonly extensionLogPath: string
+  ) {}
 
   public start(onValidatedFileEvent: (filePath: string, metadata: CopilotTelemetryFileMetadata) => void): void {
     this.runDiscovery(onValidatedFileEvent);
@@ -98,20 +84,36 @@ export class CopilotLogDiscovery implements vscode.Disposable {
         .filter((entry) => entry.isDirectory())
         .map((entry) => path.join(root, entry.name));
 
-      for (const sessionDir of sessionDirs) {
-        this.log.info(`[DISCOVERY] session dir: ${sessionDir}`);
-        this.walkDirectory(sessionDir, (filePath) => {
-          const metadata = this.validateTelemetryFile(filePath);
-          if (!metadata) {
-            return;
-          }
-
-          if (!this.acceptedFiles.has(filePath)) {
-            newlyAccepted.push(metadata);
-            this.acceptedFiles.set(filePath, metadata);
-          }
-        });
+      const activeSessionDir = this.resolveActiveSessionDir(sessionDirs);
+      if (!activeSessionDir) {
+        continue;
       }
+
+      for (const sessionDir of sessionDirs) {
+        if (sessionDir === activeSessionDir) {
+          continue;
+        }
+        this.log.info(`[SESSION] ignored historical session: ${sessionDir}`);
+      }
+
+      this.log.info(`[SESSION] active session dir: ${activeSessionDir}`);
+
+      const activeWindowDir = this.resolveActiveWindowDir(activeSessionDir);
+      if (!activeWindowDir) {
+        continue;
+      }
+
+      this.walkDirectory(activeWindowDir, (filePath) => {
+        const metadata = this.validateTelemetryFile(filePath);
+        if (!metadata) {
+          return;
+        }
+
+        if (!this.acceptedFiles.has(filePath)) {
+          newlyAccepted.push(metadata);
+          this.acceptedFiles.set(filePath, metadata);
+        }
+      });
     }
 
     this.log.info(`[DISCOVERY] total accepted files: ${this.acceptedFiles.size}`);
@@ -136,9 +138,6 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       const childPath = path.join(dirPath, entry.name);
 
       if (entry.isDirectory()) {
-        if (this.isDeniedPath(childPath)) {
-          continue;
-        }
         this.walkDirectory(childPath, onFile);
         continue;
       }
@@ -153,11 +152,6 @@ export class CopilotLogDiscovery implements vscode.Disposable {
 
   private validateTelemetryFile(filePath: string): CopilotTelemetryFileMetadata | undefined {
     this.log.info(`[DISCOVERY] validating: ${filePath}`);
-
-    if (this.isDeniedPath(filePath)) {
-      this.log.info(`[DISCOVERY] rejected: ${filePath}`);
-      return undefined;
-    }
 
     const extension = path.extname(filePath).toLowerCase();
     if (!ALLOWED_EXTENSIONS.has(extension)) {
@@ -180,28 +174,27 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       return undefined;
     }
 
-    const lines = this.readFirstLines(filePath, DISCOVERY_SCAN_LINE_LIMIT, DISCOVERY_SCAN_BYTE_LIMIT);
+    const lines = this.readTailLines(filePath, DISCOVERY_SCAN_LINE_LIMIT, DISCOVERY_SCAN_BYTE_LIMIT);
     const normalized = lines.join('\n').toLowerCase();
-    const matchedSignatures = TELEMETRY_SIGNATURES.filter((signature) => normalized.includes(signature));
 
-    if (matchedSignatures.length === 0) {
+    const classification = this.sourceClassifier.classify(filePath, normalized);
+    if (!classification.accepted) {
       this.validationCache.set(filePath, {
         size: stat.size,
         mtimeMs: stat.mtimeMs,
       });
-      this.log.info(`[DISCOVERY] rejected: ${filePath}`);
+      this.log.info(`[DISCOVERY] rejected: ${filePath} reason=${classification.reason}`);
       return undefined;
     }
 
-    this.log.info(
-      `[DISCOVERY] telemetry signature matched: ${filePath} -> ${matchedSignatures.join(', ')}`
-    );
+    const matchedSignatures = classification.matchedSignatureTokens;
+    this.log.info(`[DISCOVERY] accepted source: ${filePath} reason=${classification.reason}`);
 
     const metadata: CopilotTelemetryFileMetadata = {
       sourcePath: filePath,
       sourceType: this.getSourceType(filePath),
       discoveryTimestamp: Date.now(),
-      validationConfidence: Math.min(1, 0.5 + matchedSignatures.length / TELEMETRY_SIGNATURES.length),
+      validationConfidence: Math.min(1, 0.5 + matchedSignatures.length / 10),
       matchedSignatures,
     };
 
@@ -213,6 +206,68 @@ export class CopilotLogDiscovery implements vscode.Disposable {
 
     this.log.info(`[DISCOVERY] accepted: ${filePath}`);
     return metadata;
+  }
+
+  private resolveActiveSessionDir(sessionDirs: string[]): string | undefined {
+    const sessionCandidates = sessionDirs
+      .map((sessionDir) => ({
+        sessionDir,
+        score: this.parseSessionDirectoryScore(path.basename(sessionDir)),
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score);
+
+    if (sessionCandidates.length > 0) {
+      return sessionCandidates[0].sessionDir;
+    }
+
+    const fallback = sessionDirs
+      .map((sessionDir) => ({
+        sessionDir,
+        mtimeMs: this.safeStat(sessionDir)?.mtimeMs ?? 0,
+      }))
+      .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+    return fallback[0]?.sessionDir;
+  }
+
+  private resolveActiveWindowDir(sessionDir: string): string | undefined {
+    const dirs = this.safeReadDir(sessionDir)
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(sessionDir, entry.name));
+
+    const windowDirs = dirs.filter((candidate) => this.getWindowRank(candidate) >= 0);
+    if (windowDirs.length === 0) {
+      return undefined;
+    }
+
+    const preferredFromExtensionPath = windowDirs.find((candidate) =>
+      this.extensionLogPath.toLowerCase().includes(candidate.toLowerCase())
+    );
+
+    const activeWindowDir =
+      preferredFromExtensionPath ??
+      windowDirs
+        .sort((left, right) => {
+          const rankDelta = this.getWindowRank(right) - this.getWindowRank(left);
+          if (rankDelta !== 0) {
+            return rankDelta;
+          }
+
+          const rightMtime = this.safeStat(right)?.mtimeMs ?? 0;
+          const leftMtime = this.safeStat(left)?.mtimeMs ?? 0;
+          return rightMtime - leftMtime;
+        })[0];
+
+    this.log.info(`[WINDOW] active window selected: ${activeWindowDir}`);
+    for (const windowDir of windowDirs) {
+      if (windowDir === activeWindowDir) {
+        continue;
+      }
+      this.log.info(`[WINDOW] ignored inactive window: ${windowDir}`);
+    }
+
+    return activeWindowDir;
   }
 
   private attachWatcher(
@@ -250,11 +305,6 @@ export class CopilotLogDiscovery implements vscode.Disposable {
     this.log.info(`[DISCOVERY] watcher attached: ${filePath}`);
   }
 
-  private isDeniedPath(filePath: string): boolean {
-    const lower = filePath.toLowerCase();
-    return this.denylistTokens.some((token) => lower.includes(token));
-  }
-
   private getSourceType(filePath: string): string {
     const ext = path.extname(filePath).toLowerCase();
     if (ext === '.copilotmd') {
@@ -263,7 +313,7 @@ export class CopilotLogDiscovery implements vscode.Disposable {
     return 'copilot-runtime-log';
   }
 
-  private readFirstLines(filePath: string, maxLines: number, maxBytes: number): string[] {
+  private readTailLines(filePath: string, maxLines: number, maxBytes: number): string[] {
     const fd = fs.openSync(filePath, 'r');
     try {
       const stats = fs.fstatSync(fd);
@@ -273,13 +323,37 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       }
 
       const buffer = Buffer.alloc(readBytes);
-      fs.readSync(fd, buffer, 0, readBytes, 0);
+      const startPos = Math.max(0, stats.size - readBytes);
+      fs.readSync(fd, buffer, 0, readBytes, startPos);
       const text = buffer.toString('utf-8');
       const lines = text.split(/\r?\n/);
-      return lines.slice(0, maxLines);
+      return lines.slice(-maxLines);
     } finally {
       fs.closeSync(fd);
     }
+  }
+
+  private parseSessionDirectoryScore(sessionName: string): number {
+    if (!SESSION_DIR_REGEX.test(sessionName)) {
+      return 0;
+    }
+
+    const year = Number.parseInt(sessionName.slice(0, 4), 10);
+    const month = Number.parseInt(sessionName.slice(4, 6), 10);
+    const day = Number.parseInt(sessionName.slice(6, 8), 10);
+    const hour = Number.parseInt(sessionName.slice(9, 11), 10);
+    const minute = Number.parseInt(sessionName.slice(11, 13), 10);
+    const second = Number.parseInt(sessionName.slice(13, 15), 10);
+    return Date.UTC(year, month - 1, day, hour, minute, second);
+  }
+
+  private getWindowRank(windowDir: string): number {
+    const basename = path.basename(windowDir).toLowerCase();
+    const match = /^window(\d+)$/.exec(basename);
+    if (!match) {
+      return -1;
+    }
+    return Number.parseInt(match[1], 10);
   }
 
   private safeReadDir(dirPath: string): fs.Dirent[] {

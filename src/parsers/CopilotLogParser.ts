@@ -7,6 +7,7 @@ import {
   CopilotLogDiscovery,
   CopilotTelemetryFileMetadata,
 } from '../telemetry/discovery/CopilotLogDiscovery';
+import { TelemetrySourceClassifier } from '../telemetry/discovery/TelemetrySourceClassifier';
 
 /**
  * Observes GitHub Copilot Chat log files and emits parsed CopilotLogEvent
@@ -33,12 +34,12 @@ export class CopilotLogParser implements vscode.Disposable {
   private readonly dedupeWindowMs = 3000;
   private readonly acceptedWatcherPaths = new Set<string>();
   private readonly discovery: CopilotLogDiscovery;
+  private readonly sourceClassifier = new TelemetrySourceClassifier();
   private readonly fileMetadata = new Map<string, CopilotTelemetryFileMetadata>();
   private readonly checkpointKey = 'burnsight.copilotLogParser.checkpoints';
 
   private readonly hardIgnoreTokens = [
     'burnsight',
-    'telemetry',
     'runtimeinspector',
     'extension-output',
     'outputchannel',
@@ -52,7 +53,7 @@ export class CopilotLogParser implements vscode.Disposable {
     private readonly checkpointStore?: vscode.Memento
   ) {
     this.log = log;
-    this.discovery = new CopilotLogDiscovery(this.log);
+    this.discovery = new CopilotLogDiscovery(this.log, this.extensionLogPath);
     this.log.info('[CopilotLogParser] Initializing');
     this.discoverAndWatch();
   }
@@ -65,8 +66,13 @@ export class CopilotLogParser implements vscode.Disposable {
     this.log.info(`[CopilotLogParser] Discovery anchored from extension log path: ${this.extensionLogPath}`);
     this.discovery.start((filePath, metadata) => {
       this.fileMetadata.set(filePath, metadata);
+      const isFirstAttach = !this.acceptedWatcherPaths.has(filePath);
       this.acceptedWatcherPaths.add(filePath);
-      this.readNewContent(filePath);
+      if (isFirstAttach) {
+        this.attachTailAtEof(filePath);
+      } else {
+        this.readNewContent(filePath);
+      }
       this.logAcceptedWatcherSummary();
     });
 
@@ -93,7 +99,7 @@ export class CopilotLogParser implements vscode.Disposable {
     try {
       const stats = fs.statSync(filePath);
       const checkpointPos = this.getCheckpoint(filePath);
-      const inMemoryPos = this.filePositions.get(filePath) ?? 0;
+      const inMemoryPos = this.filePositions.get(filePath) ?? stats.size;
       const lastPos = Math.min(stats.size, Math.max(checkpointPos, inMemoryPos));
       if (stats.size <= lastPos) {
         this.filePositions.set(filePath, stats.size);
@@ -106,6 +112,8 @@ export class CopilotLogParser implements vscode.Disposable {
       const fd = fs.openSync(filePath, 'r');
       fs.readSync(fd, buffer, 0, length, lastPos);
       fs.closeSync(fd);
+
+      this.log.info(`[TAILER] appended bytes=${length} file=${filePath}`);
 
       this.filePositions.set(filePath, stats.size);
       this.saveCheckpoint(filePath, stats.size);
@@ -146,6 +154,11 @@ export class CopilotLogParser implements vscode.Disposable {
     }
 
     if (!Patterns.isRelevantLine(line)) {
+      return;
+    }
+
+    const sourceClassification = this.sourceClassifier.classify(sourceFile, line);
+    if (!sourceClassification.accepted) {
       return;
     }
 
@@ -243,8 +256,28 @@ export class CopilotLogParser implements vscode.Disposable {
       event.success = true;
     }
 
-    this.log.info(`[CopilotLogParser] event=${JSON.stringify(event)}`);
+    this.log.info(
+      `[PARSER] accepted copilot event requestId=${event.requestId} stage=${event.stage} fileOffset=${fileOffset}`
+    );
     this.bus.emit('copilot.request', event);
+  }
+
+  private attachTailAtEof(filePath: string): void {
+    if (this.shouldIgnoreFile(filePath)) {
+      this.log.info(`[TAILER] ignored file attach: ${filePath}`);
+      return;
+    }
+
+    try {
+      const stats = fs.statSync(filePath);
+      const eofOffset = stats.size;
+      this.filePositions.set(filePath, eofOffset);
+      this.fileRemainders.set(filePath, '');
+      this.saveCheckpoint(filePath, eofOffset);
+      this.log.info(`[TAILER] attached eof offset=${eofOffset} file=${filePath}`);
+    } catch (err) {
+      this.log.warn(`[TAILER] attach failed file=${filePath} err=${String(err)}`);
+    }
   }
 
   private getCheckpoint(filePath: string): number {

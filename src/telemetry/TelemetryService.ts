@@ -63,6 +63,13 @@ export class TelemetryService implements vscode.Disposable {
   ) {
     this.stateStore = stateStore ?? new TelemetryStateStore(TelemetryService.createEmptyState());
     this.state = this.stateStore.get();
+    if (this.state.sessionStartedAt === null) {
+      this.state = this.stateStore.update((prev) => ({
+        ...prev,
+        sessionStartedAt: Date.now(),
+      }));
+      this.log.info(`[SESSION] live session started at activation: ${this.state.sessionStartedAt}`);
+    }
     this.latestSnapshot = this.buildSnapshot();
 
     this.readDebugConfiguration();
@@ -194,10 +201,6 @@ export class TelemetryService implements vscode.Disposable {
     this.state = this.stateStore.update((prev) => {
       const next: TelemetryState = { ...prev };
       const now = event.timestamp;
-
-      if (next.sessionStartedAt === null) {
-        next.sessionStartedAt = now;
-      }
       next.lastActivityAt = now;
       next.observedCharCount += event.observedChars;
 
@@ -291,9 +294,8 @@ export class TelemetryService implements vscode.Disposable {
     }
 
     if (accountedRequest) {
-      this.log.info(
-        `[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests}`
-      );
+      this.log.info(`[ACCOUNTING] request incremented model=${this.state.activeModel} total=${this.state.requestCount}`);
+      this.log.info(`[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests}`);
     }
 
     this.bus.emit('telemetry.updated', {
@@ -433,16 +435,15 @@ export class TelemetryService implements vscode.Disposable {
 
   private buildSnapshot(): OverlaySnapshot {
     const state = this.state;
-    const hasTelemetry = state.requestCount > 0;
     const nowMs = Date.now();
 
     const sessionDurationMs =
       state.sessionStartedAt !== null ? Math.max(0, nowMs - state.sessionStartedAt) : 0;
-    const sessionDuration = hasTelemetry ? formatDuration(sessionDurationMs) : '0s';
+    const sessionDuration = formatDuration(sessionDurationMs);
 
     const averageLatency = state.averageLatencyMs;
 
-    const modelRows: string[][] = hasTelemetry
+    const modelRows: string[][] = state.requestCount > 0
       ? state.modelHistory.map((modelName) => {
           const modelRequests = state.modelRequestCounts[modelName] ?? 0;
           const modelLatency = state.modelLatencyStats[modelName];
@@ -502,7 +503,7 @@ export class TelemetryService implements vscode.Disposable {
       {
         id: 'estimatedTotalTokens',
         label: 'Estimated Total Tokens',
-        confidence: ConfidenceLevel.HEURISTIC,
+        confidence: ConfidenceLevel.ESTIMATED,
         value: 'n/a',
         formatted: 'n/a',
         notes: 'Pending real token telemetry integration.',
@@ -510,7 +511,7 @@ export class TelemetryService implements vscode.Disposable {
       {
         id: 'estimatedCost',
         label: 'Estimated Economics',
-        confidence: ConfidenceLevel.HEURISTIC,
+        confidence: ConfidenceLevel.ESTIMATED,
         value: 'n/a',
         formatted: 'n/a',
         notes: 'Pending real token telemetry integration.',
@@ -526,7 +527,7 @@ export class TelemetryService implements vscode.Disposable {
       {
         id: 'averageRequestCost',
         label: 'Avg Request Cost',
-        confidence: ConfidenceLevel.HEURISTIC,
+        confidence: ConfidenceLevel.ESTIMATED,
         value: 'n/a',
         formatted: 'n/a',
         notes: 'Pending real token telemetry integration.',
