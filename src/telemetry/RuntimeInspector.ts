@@ -31,6 +31,12 @@ export class RuntimeInspector implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[] = [];
   private readonly lastInsertionAtByFile = new Map<string, number>();
   private readonly recentChanges: ChangeWindow[] = [];
+  private readonly ignoredDocumentTokens = [
+    'burnsight',
+    'burnsight telemetry',
+    'runtimeinspector',
+    'extension-output',
+  ] as const;
 
   constructor(
     private readonly bus: EventBus<BurnSightEvents>,
@@ -64,6 +70,12 @@ export class RuntimeInspector implements vscode.Disposable {
   // --------------------------------------------------------------------------
 
   private onTextChange(event: vscode.TextDocumentChangeEvent): void {
+    if (this.shouldIgnoreDocument(event.document)) {
+      return;
+    }
+
+    this.log.info(`[DOC-WATCHER] accepted source: ${event.document.fileName}`);
+
     if (event.contentChanges.length === 0) {
       return;
     }
@@ -235,5 +247,26 @@ export class RuntimeInspector implements vscode.Disposable {
     while (this.recentChanges.length > 0 && (this.recentChanges[0]?.timestamp ?? 0) < cutoff) {
       this.recentChanges.shift();
     }
+  }
+
+  private shouldIgnoreDocument(document: vscode.TextDocument): boolean {
+    // Silent early return: ignored branches must not write to output,
+    // otherwise debug logs can recursively trigger onDidChangeTextDocument.
+    if (document.uri.scheme === 'output') {
+      return true;
+    }
+
+    const fileName = (document.fileName || '').toLowerCase();
+    const uriPath = (document.uri.path || '').toLowerCase();
+    const uriString = document.uri.toString().toLowerCase();
+    const containsIgnoredToken = this.ignoredDocumentTokens.some(
+      (token) => fileName.includes(token) || uriPath.includes(token) || uriString.includes(token)
+    );
+
+    if (containsIgnoredToken) {
+      return true;
+    }
+
+    return false;
   }
 }
