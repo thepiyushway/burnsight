@@ -6,6 +6,10 @@ export function formatCurrency(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
+export function formatApproxCurrency(value: number): string {
+  return `~$${value.toFixed(2)}`;
+}
+
 export function formatPercent(value: number): string {
   return `${Math.round(value)}%`;
 }
@@ -24,4 +28,15 @@ export function formatCompact(value: number): string {
   }
 
   return toFixedTrimmed(value, 0);
+}
+
+export function formatTokenCount(value: number): string {
+  const rounded = Math.max(0, Math.round(value));
+  if (rounded >= 1_000_000) {
+    return `${toFixedTrimmed(rounded / 1_000_000, 1)}m tokens`;
+  }
+  if (rounded >= 1_000) {
+    return `${toFixedTrimmed(rounded / 1_000, 1)}k tokens`;
+  }
+  return `${rounded} tokens`;
 }

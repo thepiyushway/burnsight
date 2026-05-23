@@ -4,8 +4,14 @@ export interface AIRequestEvent {
   requestId: string;
   status: 'success' | 'cancelled' | 'error' | string;
   model: string;
+  modelChain?: string[];
+  routedFromModel?: string;
+  hasEscalation?: boolean;
+  escalationCount?: number;
   latencyMs: number;
   feature: string;
+  isRetry?: boolean;
+  retryCount?: number;
   rawLine: string;
   sourceFile: string;
   fileOffset: number;
@@ -28,9 +34,14 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
 };
 
 export interface AIEconomicEvent extends AIRequestEvent {
-  estimatedInputTokens?: number;
-  estimatedOutputTokens?: number;
-  estimatedCostUsd?: number;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  estimatedTotalTokens: number;
+  estimatedCostUsd: number;
+  retryAmplification: number;
+  escalationAmplification: number;
+  orchestrationAmplification: number;
+  retryAmplifiedCostUsd: number;
   pricingAvailable: boolean;
 }
 
@@ -47,6 +58,19 @@ export interface SessionMetrics {
   requestsByFeature: Record<string, number>;
 
   retryRequests: number;
+  escalationCount: number;
 
-  estimatedTotalCostUsd?: number;
+  estimatedTotalInputTokens: number;
+  estimatedTotalOutputTokens: number;
+  estimatedTotalTokens: number;
+
+  estimatedTotalCostUsd: number;
+  estimatedBurnRatePerHour: number;
+
+  modelCostUsd: Record<string, number>;
+  workflowCostUsd: Record<string, number>;
+  workflowTokenUsage: Record<string, { input: number; output: number }>;
+  retryAmplificationCostUsd: number;
+  retryCostPercentage: number;
+
 }

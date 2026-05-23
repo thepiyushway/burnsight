@@ -90,9 +90,14 @@ suite('Normalized Telemetry Pipeline', () => {
       sourceFile: '/tmp/copilot.log',
       fileOffset: 10,
       pricingAvailable: true,
-      estimatedInputTokens: undefined,
-      estimatedOutputTokens: undefined,
-      estimatedCostUsd: undefined,
+      estimatedInputTokens: 800,
+      estimatedOutputTokens: 400,
+      estimatedTotalTokens: 1200,
+      estimatedCostUsd: 0.012,
+      retryAmplification: 1,
+      escalationAmplification: 1,
+      orchestrationAmplification: 1.2,
+      retryAmplifiedCostUsd: 0,
     });
 
     assert.strictEqual(m1.totalRequests, 1);
@@ -113,9 +118,14 @@ suite('Normalized Telemetry Pipeline', () => {
       sourceFile: '/tmp/copilot.log',
       fileOffset: 20,
       pricingAvailable: false,
-      estimatedInputTokens: undefined,
-      estimatedOutputTokens: undefined,
-      estimatedCostUsd: undefined,
+      estimatedInputTokens: 1200,
+      estimatedOutputTokens: 300,
+      estimatedTotalTokens: 1500,
+      estimatedCostUsd: 0.02,
+      retryAmplification: 1.8,
+      escalationAmplification: 1,
+      orchestrationAmplification: 1.6,
+      retryAmplifiedCostUsd: 0.008,
     });
 
     assert.strictEqual(m2.totalRequests, 2);
@@ -123,5 +133,8 @@ suite('Normalized Telemetry Pipeline', () => {
     assert.strictEqual(m2.retryRequests, 1);
     assert.strictEqual(m2.totalLatencyMs, 1500);
     assert.strictEqual(m2.averageLatencyMs, 750);
+    assert.strictEqual(m2.estimatedTotalTokens, 2700);
+    assert.strictEqual(m2.estimatedTotalCostUsd > m1.estimatedTotalCostUsd, true);
+    assert.strictEqual(m2.retryAmplificationCostUsd > 0, true);
   });
 });

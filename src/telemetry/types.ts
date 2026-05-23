@@ -153,6 +153,8 @@ export interface TelemetryState {
   errorCount: number;
   /** Requests classified as retries */
   retryRequests: number;
+  /** Number of observed model escalations (chain hops) */
+  escalationCount: number;
   /** Unique request IDs observed (used for deduplication) */
   requestIds: string[];
   /** Finish reason histogram: reason → count */
@@ -187,14 +189,22 @@ export interface TelemetryState {
   estimatedContextTokens: number;
   /** Per-model estimated token breakdown */
   modelTokens: Record<string, { input: number; output: number }>;
+  /** Per-workflow estimated token breakdown */
+  workflowTokens: Record<string, { input: number; output: number }>;
 
   // ---- ESTIMATED (cost = tokens × pricing table) -------------------------
   /** Total estimated session cost in USD */
   estimatedTotalCost: number;
   /** Per-model estimated cost in USD */
   modelCosts: Record<string, number>;
+  /** Per-workflow estimated cost in USD */
+  workflowCosts: Record<string, number>;
   /** Estimated burn rate in USD/hour — HEURISTIC (extrapolated from session) */
   estimatedBurnRatePerHour: number;
+  /** Estimated retry-amplified cost in USD */
+  retryAmplificationCost: number;
+  /** Estimated retry cost share as percentage of total cost */
+  retryCostPercentage: number;
 
   // ---- Debug / audit ring buffer (REAL) ----------------------------------
   /** Most recent parsed log events, newest first; max 50 entries */

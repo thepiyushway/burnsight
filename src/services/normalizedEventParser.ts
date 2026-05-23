@@ -19,9 +19,11 @@ export class NormalizedEventParser {
     const requestId = match[1];
     const statusRaw = match[2].toLowerCase();
     const modelChain = match[3].trim();
+    const modelChainParts = this.extractModelChain(modelChain);
     const model = this.extractRoutedModel(modelChain);
     const latencyMs = Number.parseInt(match[4], 10);
     const feature = match[5].trim();
+    const retryCount = this.extractRetryCount(feature);
 
     const status =
       statusRaw === 'success'
@@ -38,8 +40,14 @@ export class NormalizedEventParser {
       requestId,
       status,
       model,
+      modelChain: modelChainParts,
+      routedFromModel: modelChainParts.length > 1 ? modelChainParts[modelChainParts.length - 2] : undefined,
+      hasEscalation: modelChainParts.length > 1,
+      escalationCount: Math.max(0, modelChainParts.length - 1),
       latencyMs,
       feature,
+      isRetry: retryCount > 0,
+      retryCount,
       rawLine: input.rawLine,
       sourceFile: input.sourceFile,
       fileOffset: input.fileOffset,
@@ -51,11 +59,26 @@ export class NormalizedEventParser {
   }
 
   private extractRoutedModel(modelChain: string): string {
-    if (!modelChain.includes('->')) {
-      return modelChain;
+    const parts = this.extractModelChain(modelChain);
+    return parts[parts.length - 1] ?? modelChain;
+  }
+
+  private extractModelChain(modelChain: string): string[] {
+    return modelChain.split('->').map((part) => part.trim()).filter(Boolean);
+  }
+
+  private extractRetryCount(feature: string): number {
+    const normalized = feature.toLowerCase();
+    if (!normalized.includes('retry')) {
+      return 0;
     }
 
-    const parts = modelChain.split('->').map((part) => part.trim()).filter(Boolean);
-    return parts[parts.length - 1] ?? modelChain;
+    const digitMatch = normalized.match(/retry[-_/ ]?(\d+)/i);
+    if (!digitMatch) {
+      return 1;
+    }
+
+    const parsed = Number.parseInt(digitMatch[1], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
   }
 }

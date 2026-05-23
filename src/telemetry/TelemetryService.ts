@@ -12,7 +12,13 @@ import {
   TelemetryState,
 } from './types';
 import { EventBus } from '../utils/EventBus';
-import { formatCurrency, formatInteger } from '../utils/formatters';
+import {
+  formatApproxCurrency,
+  formatCurrency,
+  formatInteger,
+  formatRate,
+  formatTokenCount,
+} from '../utils/formatters';
 import { TelemetryStateStore } from '../state/TelemetryStateStore';
 import { NormalizedEventParser } from '../services/normalizedEventParser';
 import { EventDeduper } from '../services/eventDeduper';
@@ -192,6 +198,22 @@ export class TelemetryService implements vscode.Disposable {
 
     const enriched = this.economicsEnricher.enrich(normalized);
     this.log.info(
+      `[TOKEN-EST] request=${enriched.requestId} input=${enriched.estimatedInputTokens} output=${enriched.estimatedOutputTokens}`
+    );
+    this.log.info(
+      `[COST-EST] request=${enriched.requestId} estimatedCost=${formatCurrency(enriched.estimatedCostUsd)}`
+    );
+    this.log.info(
+      `[WORKFLOW] request=${enriched.requestId} feature=${enriched.feature} orchestration=${enriched.orchestrationAmplification.toFixed(2)}x`
+    );
+    if (enriched.escalationCount && enriched.escalationCount > 0) {
+      const from = enriched.routedFromModel ?? 'unknown';
+      this.log.info(`[ESCALATION] ${from} -> ${enriched.model} count=${enriched.escalationCount}`);
+    }
+    if (enriched.retryAmplification > 1) {
+      this.log.info(`[RETRY] retry amplification=${enriched.retryAmplification.toFixed(2)}x`);
+    }
+    this.log.info(
       `[ECONOMICS] ${enriched.pricingAvailable ? `pricing found model=${enriched.model}` : `pricing missing model=${enriched.model}`}`
     );
 
@@ -250,6 +272,25 @@ export class TelemetryService implements vscode.Disposable {
       next.requestsByFeature = { ...sessionMetrics.requestsByFeature };
       next.modelRequestCounts = { ...sessionMetrics.requestsByModel };
       next.retryRequests = sessionMetrics.retryRequests;
+      next.escalationCount = sessionMetrics.escalationCount;
+
+      next.estimatedInputTokens = sessionMetrics.estimatedTotalInputTokens;
+      next.estimatedOutputTokens = sessionMetrics.estimatedTotalOutputTokens;
+      next.estimatedTotalTokens = sessionMetrics.estimatedTotalTokens;
+      next.estimatedTotalCost = sessionMetrics.estimatedTotalCostUsd;
+      next.estimatedBurnRatePerHour = sessionMetrics.estimatedBurnRatePerHour;
+      next.modelCosts = { ...sessionMetrics.modelCostUsd };
+      next.workflowCosts = { ...sessionMetrics.workflowCostUsd };
+      next.workflowTokens = { ...sessionMetrics.workflowTokenUsage };
+      next.retryAmplificationCost = sessionMetrics.retryAmplificationCostUsd;
+      next.retryCostPercentage = sessionMetrics.retryCostPercentage;
+
+      const nextModelTokens = { ...next.modelTokens };
+      nextModelTokens[enriched.model] = {
+        input: (nextModelTokens[enriched.model]?.input ?? 0) + enriched.estimatedInputTokens,
+        output: (nextModelTokens[enriched.model]?.output ?? 0) + enriched.estimatedOutputTokens,
+      };
+      next.modelTokens = nextModelTokens;
 
       next.latencies = [...next.latencies, enriched.latencyMs];
       next.modelLatencyStats = {
@@ -295,7 +336,7 @@ export class TelemetryService implements vscode.Disposable {
 
     if (accountedRequest) {
       this.log.info(`[ACCOUNTING] request incremented model=${this.state.activeModel} total=${this.state.requestCount}`);
-      this.log.info(`[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests}`);
+      this.log.info(`[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests} estCost=${formatCurrency(this.state.estimatedTotalCost)} estTokens=${Math.round(this.state.estimatedTotalTokens)}`);
     }
 
     this.bus.emit('telemetry.updated', {
@@ -442,6 +483,7 @@ export class TelemetryService implements vscode.Disposable {
     const sessionDuration = formatDuration(sessionDurationMs);
 
     const averageLatency = state.averageLatencyMs;
+    const avgRequestCost = state.requestCount > 0 ? state.estimatedTotalCost / state.requestCount : 0;
 
     const modelRows: string[][] = state.requestCount > 0
       ? state.modelHistory.map((modelName) => {
@@ -450,9 +492,28 @@ export class TelemetryService implements vscode.Disposable {
           const avgModelLatency = modelLatency
             ? Math.round(modelLatency.totalMs / Math.max(1, modelLatency.count))
             : 0;
-          return [modelName, formatInteger(modelRequests), `${avgModelLatency}ms`];
+          return [
+            modelName,
+            formatInteger(modelRequests),
+            `${avgModelLatency}ms`,
+            formatApproxCurrency(state.modelCosts[modelName] ?? 0),
+          ];
         })
-      : [['—', '0', '0ms']];
+      : [['—', '0', '0ms', '~$0.00']];
+
+    const workflowRows: string[][] = Object.keys(state.workflowCosts).length > 0
+      ? Object.entries(state.workflowCosts)
+          .sort((left, right) => right[1] - left[1])
+          .slice(0, 8)
+          .map(([workflow, cost]) => [
+            workflow,
+            formatApproxCurrency(cost),
+            formatTokenCount(
+              (state.workflowTokens[workflow]?.input ?? 0) +
+                (state.workflowTokens[workflow]?.output ?? 0)
+            ),
+          ])
+      : [['—', '~$0.00', '0 tokens']];
 
     const finishReasonRows = Object.entries(state.finishReasons).length
       ? Object.entries(state.finishReasons)
@@ -464,6 +525,7 @@ export class TelemetryService implements vscode.Disposable {
       : [{ label: 'no-data', value: '0' }];
 
     const mostUsedModel = this.getMostUsedModel(state.modelRequestCounts);
+    const mostExpensiveModel = this.getMostExpensiveModel(state.modelCosts);
     const topWorkflow = this.getMostUsedModel(state.requestsByFeature);
     const distribution = this.formatModelDistribution(state.modelRequestCounts, state.requestCount);
 
@@ -490,7 +552,7 @@ export class TelemetryService implements vscode.Disposable {
         confidence: ConfidenceLevel.REAL,
         value: sessionDurationMs,
         formatted: sessionDuration,
-        notes: 'Elapsed wall-clock time since first observed request event.',
+        notes: 'Elapsed wall-clock time since extension activation.',
       },
       {
         id: 'averageLatency',
@@ -504,33 +566,33 @@ export class TelemetryService implements vscode.Disposable {
         id: 'estimatedTotalTokens',
         label: 'Estimated Total Tokens',
         confidence: ConfidenceLevel.ESTIMATED,
-        value: 'n/a',
-        formatted: 'n/a',
-        notes: 'Pending real token telemetry integration.',
+        value: state.estimatedTotalTokens,
+        formatted: formatTokenCount(state.estimatedTotalTokens),
+        notes: 'Deterministic estimate from model/workflow/latency heuristics.',
       },
       {
         id: 'estimatedCost',
         label: 'Estimated Economics',
         confidence: ConfidenceLevel.ESTIMATED,
-        value: 'n/a',
-        formatted: 'n/a',
-        notes: 'Pending real token telemetry integration.',
+        value: state.estimatedTotalCost,
+        formatted: formatApproxCurrency(state.estimatedTotalCost),
+        notes: 'Estimated from token projection and pricing registry lookup.',
       },
       {
         id: 'estimatedBurnRate',
         label: 'Burn Velocity',
-        confidence: ConfidenceLevel.HEURISTIC,
-        value: 'n/a',
-        formatted: 'n/a',
-        notes: 'Pending real token telemetry integration.',
+        confidence: ConfidenceLevel.ESTIMATED,
+        value: state.estimatedBurnRatePerHour,
+        formatted: formatRate(state.estimatedBurnRatePerHour),
+        notes: 'Estimated hourly spend extrapolated from current session.',
       },
       {
         id: 'averageRequestCost',
         label: 'Avg Request Cost',
         confidence: ConfidenceLevel.ESTIMATED,
-        value: 'n/a',
-        formatted: 'n/a',
-        notes: 'Pending real token telemetry integration.',
+        value: avgRequestCost,
+        formatted: formatApproxCurrency(avgRequestCost),
+        notes: 'Estimated total spend divided by completed request count.',
       },
     ];
 
@@ -570,10 +632,10 @@ export class TelemetryService implements vscode.Disposable {
         {
           id: 'session',
           kind: 'session',
-          title: 'SESSION OVERVIEW',
-          mainValue: formatInteger(state.requestCount),
-          progressLabel: 'SESSION DURATION',
-          progressValue: sessionDuration,
+          title: 'SESSION ESTIMATED SPEND',
+          mainValue: formatApproxCurrency(state.estimatedTotalCost),
+          progressLabel: 'SESSION BURN',
+          progressValue: formatRate(state.estimatedBurnRatePerHour),
           progressPct: state.requestCount > 0 ? Math.min(100, state.requestCount) : 0,
           rows: [
             {
@@ -582,12 +644,12 @@ export class TelemetryService implements vscode.Disposable {
               accent: 'cyan',
             },
             {
-              label: 'AVG LATENCY',
-              value: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
+              label: 'EST. TOKENS',
+              value: formatTokenCount(state.estimatedTotalTokens),
             },
             {
-              label: 'RETRY REQUESTS',
-              value: formatInteger(state.retryRequests),
+              label: 'SESSION DURATION',
+              value: sessionDuration,
               accent: 'orange',
             },
           ],
@@ -595,9 +657,16 @@ export class TelemetryService implements vscode.Disposable {
         {
           id: 'models',
           kind: 'table',
-          title: 'MODEL ANALYTICS (REAL)',
-          columns: ['MODEL', 'REQS', 'AVG LAT'],
+          title: 'MODEL ANALYTICS (REAL + ESTIMATED)',
+          columns: ['MODEL', 'REQS', 'AVG LAT', 'EST. COST'],
           rows: modelRows,
+        },
+        {
+          id: 'workflows',
+          kind: 'table',
+          title: 'WORKFLOW SPEND (ESTIMATED)',
+          columns: ['WORKFLOW', 'EST. COST', 'EST. TOKENS'],
+          rows: workflowRows,
         },
         {
           id: 'model-insights',
@@ -610,17 +679,22 @@ export class TelemetryService implements vscode.Disposable {
               value: mostUsedModel,
             },
             {
+              label: 'MOST EXPENSIVE MODEL',
+              value: mostExpensiveModel,
+              accent: 'cyan',
+            },
+            {
               label: 'TOP WORKFLOW',
               value: topWorkflow,
               accent: 'orange',
             },
             {
-              label: 'REQUEST DISTRIBUTION',
-              value: distribution,
+              label: 'RETRY COST SHARE',
+              value: `${Math.round(state.retryCostPercentage)}%`,
             },
           ],
-          footerLabel: 'RETRY REQUESTS',
-          footerValue: formatInteger(state.retryRequests),
+          footerLabel: 'REQUEST DISTRIBUTION',
+          footerValue: distribution,
         },
         {
           id: 'lifecycle',
@@ -685,6 +759,7 @@ export class TelemetryService implements vscode.Disposable {
       cancelledCount: 0,
       errorCount: 0,
       retryRequests: 0,
+      escalationCount: 0,
       requestIds: [],
       finishReasons: {},
       sessionArtifacts: [],
@@ -698,9 +773,13 @@ export class TelemetryService implements vscode.Disposable {
       estimatedTotalTokens: 0,
       estimatedContextTokens: 0,
       modelTokens: {},
+      workflowTokens: {},
       estimatedTotalCost: 0,
       modelCosts: {},
+      workflowCosts: {},
       estimatedBurnRatePerHour: 0,
+      retryAmplificationCost: 0,
+      retryCostPercentage: 0,
       recentEvents: [],
       timeline: [],
       modelLatencyStats: {},

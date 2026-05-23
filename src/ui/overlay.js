@@ -11,8 +11,6 @@ const titleEl = document.getElementById('title');
 const versionEl = document.getElementById('version');
 const runtimeLabelEl = document.getElementById('runtime-label');
 
-let previousSnapshot = undefined;
-
 function safeText(value) {
   return value === undefined || value === null ? '' : String(value);
 }
@@ -67,13 +65,50 @@ function renderSnapshot(snapshot) {
 
   applyRuntimeState(snapshot);
 
-  const html = (snapshot.cards || []).map((card) => renderCard(card)).join('');
-  cardsRoot.innerHTML = html;
+  patchCards(snapshot.cards || []);
   debugShell.innerHTML = renderDebugSection(snapshot.debug);
 
   applyAnimatedValues(snapshot);
 
-  previousSnapshot = snapshot;
+}
+
+function patchCards(cards) {
+  const nextIds = new Set(cards.map((card) => safeText(card.id)));
+  const existingSections = cardsRoot.querySelectorAll('[data-card-id]');
+
+  existingSections.forEach((section) => {
+    const id = safeText(section.getAttribute('data-card-id'));
+    if (!nextIds.has(id)) {
+      section.remove();
+    }
+  });
+
+  cards.forEach((card, index) => {
+    const cardId = safeText(card.id);
+    const newMarkup = renderCard(card);
+    const existing = cardsRoot.querySelector('[data-card-id="' + cardId + '"]');
+
+    if (!existing) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = newMarkup;
+      const created = wrapper.firstElementChild;
+      if (!created) {
+        return;
+      }
+      const nextSibling = cardsRoot.children[index] || null;
+      cardsRoot.insertBefore(created, nextSibling);
+      return;
+    }
+
+    if (existing.outerHTML !== newMarkup) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = newMarkup;
+      const replacement = wrapper.firstElementChild;
+      if (replacement) {
+        existing.replaceWith(replacement);
+      }
+    }
+  });
 }
 
 window.addEventListener('message', (event) => {
