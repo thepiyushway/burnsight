@@ -20,7 +20,7 @@ export function activate(context: vscode.ExtensionContext) {
   const telemetryService = TelemetryService.initialize(bus, output);
   const logParser = new CopilotLogParser(bus, output, context.logUri.fsPath, context.globalState);
   const runtimeInspector = new RuntimeInspector(bus, output);
-  const overlayPanel = new OverlayPanel(context, telemetryService, bus);
+  const overlayPanel = new OverlayPanel(context, bus, output);
 
   registerOpenOverlayCommand(context, overlayPanel);
   registerToggleDebugModeCommand(context);

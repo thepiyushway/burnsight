@@ -104,6 +104,7 @@ export class CopilotLogParser implements vscode.Disposable {
       if (stats.size <= lastPos) {
         this.filePositions.set(filePath, stats.size);
         this.saveCheckpoint(filePath, stats.size);
+        this.log.info(`[APPEND] no new bytes file=${filePath} offset=${stats.size}`);
         return; // no new bytes
       }
 
@@ -113,7 +114,7 @@ export class CopilotLogParser implements vscode.Disposable {
       fs.readSync(fd, buffer, 0, length, lastPos);
       fs.closeSync(fd);
 
-      this.log.info(`[TAILER] appended bytes=${length} file=${filePath}`);
+      this.log.info(`[APPEND] file=${filePath} from=${lastPos} to=${stats.size} bytes=${length}`);
 
       this.filePositions.set(filePath, stats.size);
       this.saveCheckpoint(filePath, stats.size);
@@ -122,6 +123,7 @@ export class CopilotLogParser implements vscode.Disposable {
       const lines = newContent.split(/\r?\n/);
       const trailing = lines.pop() ?? '';
       this.fileRemainders.set(filePath, trailing);
+      this.log.info(`[APPEND] parsed chunk lines=${lines.length} trailingBytes=${Buffer.byteLength(trailing, 'utf-8')}`);
 
       let offsetCursor = lastPos;
       for (const line of lines) {
@@ -258,6 +260,9 @@ export class CopilotLogParser implements vscode.Disposable {
 
     this.log.info(
       `[PARSER] accepted copilot event requestId=${event.requestId} stage=${event.stage} fileOffset=${fileOffset}`
+    );
+    this.log.info(
+      `[EVENT] emitting copilot.request requestId=${event.requestId} model=${event.model ?? 'unknown'} stage=${event.stage}`
     );
     this.bus.emit('copilot.request', event);
   }

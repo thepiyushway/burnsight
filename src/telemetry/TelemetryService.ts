@@ -171,6 +171,10 @@ export class TelemetryService implements vscode.Disposable {
   }
 
   private ingestRuntimeEvent(event: CopilotLogEvent): void {
+    this.log.info(
+      `[EVENT] received copilot.request requestId=${event.requestId} source=${event.sourceFile ?? 'unknown'} stage=${event.stage}`
+    );
+
     const sourcePath = (event.sourceFile ?? '').toLowerCase();
     if (sourcePath.includes('burnsight')) {
       this.log.warn('[TelemetryService] ingestion aborted: self-source detected (burnsight)');
@@ -184,8 +188,13 @@ export class TelemetryService implements vscode.Disposable {
       fileOffset: event.fileOffset,
     });
     if (!normalized) {
+      this.log.info(`[EVENT] dropped before normalization requestId=${event.requestId}`);
       return;
     }
+
+    this.log.info(
+      `[EVENT] normalized requestId=${normalized.requestId} model=${normalized.model} feature=${normalized.feature}`
+    );
 
     this.log.info(
       `[PARSER] parsed requestId=${normalized.requestId} model=${normalized.model} latency=${normalized.latencyMs} feature=${normalized.feature}`

@@ -241,11 +241,18 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       return undefined;
     }
 
+    const mostRecentlyActiveTelemetryWindow = windowDirs
+      .map((candidate) => ({
+        windowDir: candidate,
+        telemetryMtimeMs: this.getWindowTelemetryMtime(candidate),
+      }))
+      .sort((left, right) => right.telemetryMtimeMs - left.telemetryMtimeMs)[0];
+
     const preferredFromExtensionPath = windowDirs.find((candidate) =>
       this.extensionLogPath.toLowerCase().includes(candidate.toLowerCase())
     );
 
-    const activeWindowDir =
+    const fallbackWindowDir =
       preferredFromExtensionPath ??
       windowDirs
         .sort((left, right) => {
@@ -258,6 +265,11 @@ export class CopilotLogDiscovery implements vscode.Disposable {
           const leftMtime = this.safeStat(left)?.mtimeMs ?? 0;
           return rightMtime - leftMtime;
         })[0];
+
+    const activeWindowDir =
+      (mostRecentlyActiveTelemetryWindow?.telemetryMtimeMs ?? 0) > 0
+        ? mostRecentlyActiveTelemetryWindow.windowDir
+        : fallbackWindowDir;
 
     this.log.info(`[WINDOW] active window selected: ${activeWindowDir}`);
     for (const windowDir of windowDirs) {
@@ -280,10 +292,11 @@ export class CopilotLogDiscovery implements vscode.Disposable {
     }
 
     const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(vscode.Uri.file(path.dirname(filePath)), path.basename(filePath))
+      new vscode.RelativePattern(path.dirname(filePath), path.basename(filePath))
     );
 
     const scheduleRead = () => {
+      this.log.info(`[WATCHER] fs.watch callback fired file=${filePath}`);
       const existing = this.debounceTimers.get(filePath);
       if (existing) {
         clearTimeout(existing);
@@ -291,6 +304,7 @@ export class CopilotLogDiscovery implements vscode.Disposable {
 
       const timer = setTimeout(() => {
         this.debounceTimers.delete(filePath);
+        this.log.info(`[WATCHER] debounced read scheduled file=${filePath}`);
         onValidatedFileEvent(filePath, metadata);
       }, FILE_CHANGE_DEBOUNCE_MS);
 
@@ -354,6 +368,18 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       return -1;
     }
     return Number.parseInt(match[1], 10);
+  }
+
+  private getWindowTelemetryMtime(windowDir: string): number {
+    const candidatePaths = [
+      path.join(windowDir, 'exthost', 'GitHub.copilot-chat', 'GitHub Copilot Chat.log'),
+      path.join(windowDir, 'exthost', 'GitHub.copilot', 'GitHub Copilot.log'),
+    ];
+
+    return candidatePaths.reduce((latest, candidatePath) => {
+      const stat = this.safeStat(candidatePath);
+      return Math.max(latest, stat?.mtimeMs ?? 0);
+    }, 0);
   }
 
   private safeReadDir(dirPath: string): fs.Dirent[] {
