@@ -8,30 +8,32 @@ import {
   RequestLifecycleState,
   RuntimeSignal,
   SessionState,
+  SessionTimelineEvent,
   TelemetryState,
 } from './types';
 import { EventBus } from '../utils/EventBus';
-import {
-  estimateCost,
-  estimateTokensFromChars,
-  lookupPricing,
-} from '../pricing/pricingRegistry';
-import { formatCompact, formatCurrency, formatInteger, formatRate } from '../utils/formatters';
+import { formatCurrency, formatInteger } from '../utils/formatters';
 import { TelemetryStateStore } from '../state/TelemetryStateStore';
+import { NormalizedEventParser } from '../services/normalizedEventParser';
+import { EventDeduper } from '../services/eventDeduper';
+import { EconomicsEnricher } from '../services/economicsEnricher';
+import { SessionAggregator } from '../services/sessionAggregator';
+import { AIEconomicEvent } from '../types/aiTelemetry';
 
-const VERSION = 'v2.0.0-runtime';
+const VERSION = 'v2.1.0-accounting';
 const IDLE_AFTER_MS = 5 * 60 * 1000;
 const MAX_RECENT_EVENTS = 50;
+const MAX_TIMELINE_EVENTS = 250;
 const MAX_LIFECYCLE_HISTORY = 1000;
 const WEBVIEW_UPDATE_DEBOUNCE_MS = 120;
 
 /**
  * TelemetryService is the singleton runtime telemetry authority for BurnSight.
  *
- * Confidence notes:
- * - REAL: request/model/latency/finishReason/requestId/artifact/char count
- * - ESTIMATED: tokens via chars / 4
- * - HEURISTIC: burn rate and input/output split from total estimated tokens
+ * Methodology summary:
+ * - Accounting happens only on completed request boundaries.
+ * - Deduplication is enforced by processedRequestIds.
+ * - Economic fields remain undefined until real token telemetry is available.
  */
 export class TelemetryService implements vscode.Disposable {
   private static instance: TelemetryService | undefined;
@@ -49,6 +51,10 @@ export class TelemetryService implements vscode.Disposable {
   private lastRuntimeSignalConfidence = 0;
   private lastCopilotCommand = 'none';
   private webviewDebounceTimer: NodeJS.Timeout | undefined;
+  private readonly normalizedEventParser = new NormalizedEventParser();
+  private readonly eventDeduper = new EventDeduper();
+  private readonly economicsEnricher = new EconomicsEnricher();
+  private readonly sessionAggregator = new SessionAggregator();
 
   private constructor(
     private readonly bus: EventBus<BurnSightEvents>,
@@ -158,14 +164,35 @@ export class TelemetryService implements vscode.Disposable {
       return;
     }
 
-    if (this.debugEnabled) {
-      this.log.info(`[RAW TELEMETRY] ${event.raw}`);
+    const normalized = this.normalizedEventParser.parse({
+      rawLine: event.rawLine,
+      timestamp: event.timestamp,
+      sourceFile: event.sourceFile ?? 'unknown',
+      fileOffset: event.fileOffset,
+    });
+    if (!normalized) {
+      return;
     }
 
+    this.log.info(
+      `[PARSER] parsed requestId=${normalized.requestId} model=${normalized.model} latency=${normalized.latencyMs} feature=${normalized.feature}`
+    );
+
+    if (!this.eventDeduper.shouldProcess(normalized)) {
+      this.log.info(`[DEDUPE] skipped duplicate requestId=${normalized.requestId}`);
+      return;
+    }
+
+    const enriched = this.economicsEnricher.enrich(normalized);
+    this.log.info(
+      `[ECONOMICS] ${enriched.pricingAvailable ? `pricing found model=${enriched.model}` : `pricing missing model=${enriched.model}`}`
+    );
+
     const previousSessionState = this.sessionState;
+    let accountedRequest = false;
 
     this.state = this.stateStore.update((prev) => {
-      const next = { ...prev };
+      const next: TelemetryState = { ...prev };
       const now = event.timestamp;
 
       if (next.sessionStartedAt === null) {
@@ -174,96 +201,86 @@ export class TelemetryService implements vscode.Disposable {
       next.lastActivityAt = now;
       next.observedCharCount += event.observedChars;
 
-      if (event.sessionArtifact) {
-        if (!next.sessionArtifacts.includes(event.sessionArtifact)) {
-          next.sessionArtifacts = [...next.sessionArtifacts, event.sessionArtifact];
-        }
-        next.contextAccumulatedChars += event.sessionArtifact.length;
+      if (event.sessionArtifact && !next.sessionArtifacts.includes(event.sessionArtifact)) {
+        next.sessionArtifacts = [...next.sessionArtifacts, event.sessionArtifact];
       }
 
-      const requestKey = this.resolveRequestKey(event, next);
-      const lifecycle = this.upsertLifecycle(next, requestKey, event);
-
-      if (event.requestId && !next.requestIds.includes(event.requestId)) {
-        next.requestIds = [...next.requestIds, event.requestId];
+      next.activeModel = enriched.model;
+      if (!next.modelHistory.includes(enriched.model)) {
+        next.modelHistory = [...next.modelHistory, enriched.model];
       }
 
-      if (event.model) {
-        next.activeModel = event.model;
-        if (!next.modelHistory.includes(event.model)) {
-          next.modelHistory = [...next.modelHistory, event.model];
-        }
+      const lifecycle = this.upsertLifecycle(next, enriched.requestId, event, enriched);
+
+      if (lifecycle.firstSeenAt === now && !lifecycle.accounted) {
+        next.timeline = this.appendTimeline(next.timeline, {
+          requestId: lifecycle.requestId,
+          phase: 'request_start',
+          model: lifecycle.model ?? enriched.model,
+          sourceType: lifecycle.sourceType ?? enriched.feature,
+          latencyMs: 0,
+          success: false,
+          estimatedCostUsd: 0,
+          timestamp: now,
+          rawLine: enriched.rawLine,
+        });
       }
 
-      if (event.provider) {
-        next.activeProvider = event.provider;
+      if (next.processedRequestIds[enriched.requestId]) {
+        this.log.info(`[DEDUPE] skipped duplicate requestId=${enriched.requestId}`);
+        next.recentEvents = [event, ...next.recentEvents].slice(0, MAX_RECENT_EVENTS);
+        return next;
       }
 
-      // We count requests only when a lifecycle completion marker arrives.
-      if (event.requestDone && !lifecycle.seenRequestDone) {
-        lifecycle.seenRequestDone = true;
-        lifecycle.completedAt = now;
-        next.requestCount += 1;
+      lifecycle.seenRequestDone = true;
+      lifecycle.completedAt = now;
+      lifecycle.accounted = true;
+      lifecycle.success = enriched.status === 'success';
 
-        if (lifecycle.finishReason) {
-          next.finishReasons = {
-            ...next.finishReasons,
-            [lifecycle.finishReason]: (next.finishReasons[lifecycle.finishReason] ?? 0) + 1,
-          };
-        }
+      const sessionMetrics = this.sessionAggregator.consume(enriched);
+      next.requestCount = sessionMetrics.totalRequests;
+      next.successCount = sessionMetrics.successCount;
+      next.cancelledCount = sessionMetrics.cancelledCount;
+      next.errorCount = sessionMetrics.errorCount;
+      next.totalLatencyMs = sessionMetrics.totalLatencyMs;
+      next.averageLatencyMs = sessionMetrics.averageLatencyMs;
+      next.requestsByFeature = { ...sessionMetrics.requestsByFeature };
+      next.modelRequestCounts = { ...sessionMetrics.requestsByModel };
+      next.retryRequests = sessionMetrics.retryRequests;
 
-        if (lifecycle.latencyMs !== undefined) {
-          next.latencies = [...next.latencies, lifecycle.latencyMs];
-        }
+      next.latencies = [...next.latencies, enriched.latencyMs];
+      next.modelLatencyStats = {
+        ...next.modelLatencyStats,
+        [enriched.model]: {
+          totalMs: (next.modelLatencyStats[enriched.model]?.totalMs ?? 0) + enriched.latencyMs,
+          count: (next.modelLatencyStats[enriched.model]?.count ?? 0) + 1,
+        },
+      };
 
-        const modelName = (lifecycle.model ?? next.activeModel) || 'unknown';
-        next.modelRequestCounts = {
-          ...next.modelRequestCounts,
-          [modelName]: (next.modelRequestCounts[modelName] ?? 0) + 1,
-        };
+      next.processedRequestIds = {
+        ...next.processedRequestIds,
+        [enriched.requestId]: true,
+      };
 
-        const totalTokens = estimateTokensFromChars(lifecycle.accumulatedChars);
-        // We can only estimate total tokens from chars. Split ratio is heuristic.
-        const outputTokens = Math.max(0, Math.round(totalTokens * 0.35));
-        const inputTokens = Math.max(0, totalTokens - outputTokens);
-
-        next.estimatedInputTokens += inputTokens;
-        next.estimatedOutputTokens += outputTokens;
-        next.estimatedTotalTokens += totalTokens;
-        next.estimatedContextTokens += estimateTokensFromChars(lifecycle.accumulatedChars);
-
-        const modelTokenTotals = next.modelTokens[modelName] ?? { input: 0, output: 0 };
-        next.modelTokens = {
-          ...next.modelTokens,
-          [modelName]: {
-            input: modelTokenTotals.input + inputTokens,
-            output: modelTokenTotals.output + outputTokens,
-          },
-        };
-
-        const pricing = lookupPricing(modelName);
-        const requestCost = estimateCost(inputTokens, outputTokens, pricing);
-
-        next.estimatedTotalCost += requestCost;
-        next.modelCosts = {
-          ...next.modelCosts,
-          [modelName]: (next.modelCosts[modelName] ?? 0) + requestCost,
-        };
-      }
-
-      next.contextAccumulatedChars += event.observedChars;
-      const sessionElapsedMs =
-        next.sessionStartedAt !== null ? Math.max(1, now - next.sessionStartedAt) : 0;
-      next.estimatedBurnRatePerHour =
-        sessionElapsedMs > 0 ? (next.estimatedTotalCost / sessionElapsedMs) * 3_600_000 : 0;
-
+      next.timeline = this.appendTimeline(next.timeline, {
+        requestId: enriched.requestId,
+        phase: 'request_complete',
+        model: enriched.model,
+        sourceType: enriched.feature,
+        latencyMs: enriched.latencyMs,
+        success: enriched.status === 'success',
+        estimatedCostUsd: enriched.estimatedCostUsd ?? 0,
+        timestamp: now,
+        rawLine: enriched.rawLine,
+      });
       next.recentEvents = [event, ...next.recentEvents].slice(0, MAX_RECENT_EVENTS);
+
+      accountedRequest = true;
       return next;
     });
 
     this.sessionState = SessionState.ACTIVE;
     this.scheduleIdleTransition(event.timestamp);
-
     this.latestSnapshot = this.buildSnapshot();
 
     if (previousSessionState !== this.sessionState) {
@@ -273,35 +290,26 @@ export class TelemetryService implements vscode.Disposable {
       });
     }
 
+    if (accountedRequest) {
+      this.log.info(
+        `[SESSION] totalRequests=${this.state.requestCount} avgLatency=${Math.round(this.state.averageLatencyMs)}ms retryRequests=${this.state.retryRequests}`
+      );
+    }
+
     this.bus.emit('telemetry.updated', {
       event,
       state: this.state,
       snapshot: this.latestSnapshot,
     });
 
-    this.emitSnapshotChannels();
-  }
-
-  private resolveRequestKey(event: CopilotLogEvent, state: TelemetryState): string {
-    if (event.requestId) {
-      return event.requestId;
-    }
-
-    // When no requestId is present, tie lifecycle to a synthetic key so we can
-    // still account for observed request completions without inventing values.
-    if (event.requestDone) {
-      const nextId = state.orphanRequestCounter + 1;
-      state.orphanRequestCounter = nextId;
-      return `orphan-${nextId}`;
-    }
-
-    return `orphan-pending-${state.orphanRequestCounter}`;
+    this.emitSnapshotChannels(accountedRequest);
   }
 
   private upsertLifecycle(
     state: TelemetryState,
     requestId: string,
-    event: CopilotLogEvent
+    event: CopilotLogEvent,
+    normalized?: AIEconomicEvent
   ): RequestLifecycleState {
     const existing = state.lifecycleByRequestId[requestId];
     const lifecycle: RequestLifecycleState = existing
@@ -316,13 +324,14 @@ export class TelemetryService implements vscode.Disposable {
           lastSeenAt: event.timestamp,
           accumulatedChars: event.observedChars,
           seenRequestDone: false,
+          accounted: false,
         };
 
-    if (event.model) {
-      lifecycle.model = event.model;
+    if (normalized?.model ?? event.model) {
+      lifecycle.model = normalized?.model ?? event.model;
     }
-    if (event.latencyMs !== undefined) {
-      lifecycle.latencyMs = event.latencyMs;
+    if (normalized?.latencyMs !== undefined || event.latencyMs !== undefined) {
+      lifecycle.latencyMs = normalized?.latencyMs ?? event.latencyMs;
     }
     if (event.finishReason) {
       lifecycle.finishReason = event.finishReason;
@@ -332,6 +341,17 @@ export class TelemetryService implements vscode.Disposable {
     }
     if (event.provider) {
       lifecycle.provider = event.provider;
+    }
+    if (normalized?.feature ?? event.sourceType) {
+      lifecycle.sourceType = normalized?.feature ?? event.sourceType;
+    }
+    if (normalized?.status) {
+      lifecycle.success = normalized.status === 'success';
+    } else if (event.success !== undefined) {
+      lifecycle.success = event.success;
+    }
+    if (event.requestDone) {
+      lifecycle.seenRequestDone = true;
     }
 
     const lifecycleByRequestId = {
@@ -356,6 +376,13 @@ export class TelemetryService implements vscode.Disposable {
     return lifecycle;
   }
 
+  private appendTimeline(
+    timeline: SessionTimelineEvent[],
+    event: SessionTimelineEvent
+  ): SessionTimelineEvent[] {
+    return [...timeline, event].slice(-MAX_TIMELINE_EVENTS);
+  }
+
   private scheduleIdleTransition(lastActivityAt: number): void {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -377,14 +404,16 @@ export class TelemetryService implements vscode.Disposable {
         });
       }
 
-      this.emitSnapshotChannels();
+      this.emitTelemetryAndWebview();
     }, IDLE_AFTER_MS);
   }
 
-  private emitSnapshotChannels(): void {
+  private emitSnapshotChannels(includeStatusBarUpdate: boolean): void {
     this.bus.emit('telemetry.snapshot', this.latestSnapshot);
     this.scheduleWebviewUpdate();
-    this.bus.emit('statusbar.update', this.latestSnapshot);
+    if (includeStatusBarUpdate) {
+      this.bus.emit('statusbar.update', this.latestSnapshot);
+    }
   }
 
   private emitTelemetryAndWebview(): void {
@@ -411,27 +440,18 @@ export class TelemetryService implements vscode.Disposable {
       state.sessionStartedAt !== null ? Math.max(0, nowMs - state.sessionStartedAt) : 0;
     const sessionDuration = hasTelemetry ? formatDuration(sessionDurationMs) : '0s';
 
-    const averageLatency =
-      state.latencies.length > 0
-        ? state.latencies.reduce((sum, value) => sum + value, 0) / state.latencies.length
-        : 0;
-
-    const burnRatePerHour =
-      sessionDurationMs > 0 ? (state.estimatedTotalCost / sessionDurationMs) * 3_600_000 : 0;
+    const averageLatency = state.averageLatencyMs;
 
     const modelRows: string[][] = hasTelemetry
       ? state.modelHistory.map((modelName) => {
-          const modelToken = state.modelTokens[modelName] ?? { input: 0, output: 0 };
-          const modelCost = state.modelCosts[modelName] ?? 0;
           const modelRequests = state.modelRequestCounts[modelName] ?? 0;
-          return [
-            modelName,
-            formatInteger(modelRequests),
-            formatCompact(modelToken.input + modelToken.output),
-            formatCurrency(modelCost),
-          ];
+          const modelLatency = state.modelLatencyStats[modelName];
+          const avgModelLatency = modelLatency
+            ? Math.round(modelLatency.totalMs / Math.max(1, modelLatency.count))
+            : 0;
+          return [modelName, formatInteger(modelRequests), `${avgModelLatency}ms`];
         })
-      : [['—', '0', '0', '$0.00']];
+      : [['—', '0', '0ms']];
 
     const finishReasonRows = Object.entries(state.finishReasons).length
       ? Object.entries(state.finishReasons)
@@ -442,15 +462,9 @@ export class TelemetryService implements vscode.Disposable {
           }))
       : [{ label: 'no-data', value: '0' }];
 
-    const cancelledRequests = Object.entries(state.finishReasons)
-      .filter(([reason]) => reason.includes('cancel'))
-      .reduce((sum, [, count]) => sum + count, 0);
-
-    const completionCount = Math.max(1, state.requestCount);
-    const wasteRatio = cancelledRequests / completionCount;
-    const efficiencyRatio = Math.max(0, 1 - wasteRatio);
-    const rewriteWasteUsd = state.estimatedTotalCost * wasteRatio;
-    const contextWasteTokens = Math.round(state.estimatedContextTokens * wasteRatio);
+    const mostUsedModel = this.getMostUsedModel(state.modelRequestCounts);
+    const topWorkflow = this.getMostUsedModel(state.requestsByFeature);
+    const distribution = this.formatModelDistribution(state.modelRequestCounts, state.requestCount);
 
     const metrics: DerivedMetric[] = [
       {
@@ -462,20 +476,12 @@ export class TelemetryService implements vscode.Disposable {
         notes: 'Directly observed from Copilot runtime logs.',
       },
       {
-        id: 'activeProvider',
-        label: 'Active Provider',
-        confidence: ConfidenceLevel.REAL,
-        value: state.activeProvider || 'unknown',
-        formatted: state.activeProvider || 'unknown',
-        notes: 'Provider metadata extracted from runtime logs when available.',
-      },
-      {
         id: 'requestCount',
         label: 'Request Count',
         confidence: ConfidenceLevel.REAL,
         value: state.requestCount,
         formatted: formatInteger(state.requestCount),
-        notes: 'Counted only from observed request done lifecycle markers.',
+        notes: 'Counted once per requestId after completion accounting.',
       },
       {
         id: 'sessionDuration',
@@ -491,69 +497,55 @@ export class TelemetryService implements vscode.Disposable {
         confidence: ConfidenceLevel.REAL,
         value: averageLatency,
         formatted: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
-        notes: 'Average of observed request latency fields from logs.',
+        notes: 'Average of observed/completed request latency values.',
       },
       {
         id: 'estimatedTotalTokens',
         label: 'Estimated Total Tokens',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedTotalTokens,
-        formatted: formatCompact(state.estimatedTotalTokens),
-        notes: 'Estimated from observed characters using tokens ≈ chars / 4.',
+        confidence: ConfidenceLevel.HEURISTIC,
+        value: 'n/a',
+        formatted: 'n/a',
+        notes: 'Pending real token telemetry integration.',
       },
       {
         id: 'estimatedCost',
-        label: 'Estimated Cost',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedTotalCost,
-        formatted: formatCurrency(state.estimatedTotalCost),
-        notes: 'Estimated tokens multiplied by model pricing table rates.',
+        label: 'Estimated Economics',
+        confidence: ConfidenceLevel.HEURISTIC,
+        value: 'n/a',
+        formatted: 'n/a',
+        notes: 'Pending real token telemetry integration.',
       },
       {
         id: 'estimatedBurnRate',
-        label: 'Estimated Burn Rate',
+        label: 'Burn Velocity',
         confidence: ConfidenceLevel.HEURISTIC,
-        value: burnRatePerHour,
-        formatted: formatRate(burnRatePerHour),
-        notes: 'Heuristic extrapolation: estimated cost divided by elapsed session hours.',
+        value: 'n/a',
+        formatted: 'n/a',
+        notes: 'Pending real token telemetry integration.',
       },
       {
-        id: 'contextAccumulation',
-        label: 'Context Accumulation',
-        confidence: ConfidenceLevel.ESTIMATED,
-        value: state.estimatedContextTokens,
-        formatted: formatCompact(state.estimatedContextTokens),
-        notes: 'Estimated context growth via observed telemetry and artifact characters.',
-      },
-      {
-        id: 'efficiency',
-        label: 'Session Efficiency',
+        id: 'averageRequestCost',
+        label: 'Avg Request Cost',
         confidence: ConfidenceLevel.HEURISTIC,
-        value: efficiencyRatio,
-        formatted: `${Math.round(efficiencyRatio * 100)}%`,
-        notes: 'Heuristic based on completion reasons (cancelled vs completed requests).',
-      },
-      {
-        id: 'rewriteWasteCost',
-        label: 'Rewrite Waste Cost',
-        confidence: ConfidenceLevel.HEURISTIC,
-        value: rewriteWasteUsd,
-        formatted: formatCurrency(rewriteWasteUsd),
-        notes: 'Heuristic estimated cost attributed to cancelled/retried request outcomes.',
-      },
-      {
-        id: 'contextWasteTokens',
-        label: 'Context Waste Tokens',
-        confidence: ConfidenceLevel.HEURISTIC,
-        value: contextWasteTokens,
-        formatted: formatCompact(contextWasteTokens),
-        notes: 'Heuristic estimate of context tokens not yielding final accepted responses.',
+        value: 'n/a',
+        formatted: 'n/a',
+        notes: 'Pending real token telemetry integration.',
       },
     ];
 
     const recentEvents = state.recentEvents
       .slice(0, 10)
       .map((item) => `[${new Date(item.timestamp).toISOString().slice(11, 23)}] ${item.raw}`);
+
+    const timelineRows = state.timeline
+      .slice(-8)
+      .map((entry) => [
+        new Date(entry.timestamp).toISOString().slice(11, 19),
+        entry.phase,
+        entry.model,
+        entry.latencyMs > 0 ? `${entry.latencyMs}ms` : '—',
+        entry.estimatedCostUsd > 0 ? formatCurrency(entry.estimatedCostUsd) : '$0.00',
+      ]);
 
     return {
       title: 'BURNSIGHT_RUNTIME_OBSERVABILITY',
@@ -577,8 +569,8 @@ export class TelemetryService implements vscode.Disposable {
         {
           id: 'session',
           kind: 'session',
-          title: 'SESSION COST (estimated)',
-          mainValue: hasTelemetry ? formatCurrency(state.estimatedTotalCost) : '$0.00',
+          title: 'SESSION OVERVIEW',
+          mainValue: formatInteger(state.requestCount),
           progressLabel: 'SESSION DURATION',
           progressValue: sessionDuration,
           progressPct: state.requestCount > 0 ? Math.min(100, state.requestCount) : 0,
@@ -589,16 +581,12 @@ export class TelemetryService implements vscode.Disposable {
               accent: 'cyan',
             },
             {
-              label: 'PROVIDER',
-              value: state.activeProvider || 'unknown',
+              label: 'AVG LATENCY',
+              value: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
             },
             {
-              label: 'REQUEST COUNT',
-              value: formatInteger(state.requestCount),
-            },
-            {
-              label: 'BURN RATE',
-              value: formatRate(burnRatePerHour),
+              label: 'RETRY REQUESTS',
+              value: formatInteger(state.retryRequests),
               accent: 'orange',
             },
           ],
@@ -606,44 +594,77 @@ export class TelemetryService implements vscode.Disposable {
         {
           id: 'models',
           kind: 'table',
-          title: 'MODEL BREAKDOWN (derived)',
-          columns: ['MODEL', 'REQS', 'TOK', 'COST'],
+          title: 'MODEL ANALYTICS (REAL)',
+          columns: ['MODEL', 'REQS', 'AVG LAT'],
           rows: modelRows,
         },
         {
-          id: 'tokens',
+          id: 'model-insights',
           kind: 'list',
-          title: 'TOKEN + CONTEXT (estimated)',
+          title: 'WORKFLOW INSIGHTS',
           tone: 'neutral',
           rows: [
             {
-              label: 'INPUT TOKENS',
-              value: formatCompact(state.estimatedInputTokens),
+              label: 'MOST USED MODEL',
+              value: mostUsedModel,
             },
             {
-              label: 'OUTPUT TOKENS',
-              value: formatCompact(state.estimatedOutputTokens),
-              accent: 'cyan',
+              label: 'TOP WORKFLOW',
+              value: topWorkflow,
+              accent: 'orange',
             },
             {
-              label: 'CONTEXT ACCUMULATION',
-              value: formatCompact(state.estimatedContextTokens),
+              label: 'REQUEST DISTRIBUTION',
+              value: distribution,
             },
           ],
-          footerLabel: 'AVG LATENCY',
-          footerValue: averageLatency > 0 ? `${Math.round(averageLatency)}ms` : '0ms',
+          footerLabel: 'RETRY REQUESTS',
+          footerValue: formatInteger(state.retryRequests),
         },
         {
           id: 'lifecycle',
           kind: 'list',
-          title: 'REQUEST LIFECYCLE (real)',
+          title: 'REQUEST LIFECYCLE (REAL)',
           tone: 'ok',
           rows: finishReasonRows,
           footerLabel: 'SESSION ARTIFACTS',
           footerValue: formatInteger(state.sessionArtifacts.length),
         },
+        {
+          id: 'timeline',
+          kind: 'table',
+          title: 'SESSION TIMELINE',
+          columns: ['TIME', 'PHASE', 'MODEL', 'LAT', 'COST'],
+          rows: timelineRows.length > 0 ? timelineRows : [['—', '—', '—', '—', '$0.00']],
+        },
       ],
     };
+  }
+
+  private getMostUsedModel(counts: Record<string, number>): string {
+    const sorted = Object.entries(counts).sort((left, right) => right[1] - left[1]);
+    return sorted[0]?.[0] ?? 'none';
+  }
+
+  private getMostExpensiveModel(costs: Record<string, number>): string {
+    const sorted = Object.entries(costs).sort((left, right) => right[1] - left[1]);
+    return sorted[0]?.[0] ?? 'none';
+  }
+
+  private formatModelDistribution(
+    counts: Record<string, number>,
+    totalRequests: number
+  ): string {
+    if (totalRequests <= 0) {
+      return 'none';
+    }
+
+    const parts = Object.entries(counts)
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 3)
+      .map(([model, count]) => `${model}:${Math.round((count / totalRequests) * 100)}%`);
+
+    return parts.join(' | ');
   }
 
   public static createEmptyState(): TelemetryState {
@@ -655,10 +676,18 @@ export class TelemetryService implements vscode.Disposable {
       activeProvider: '',
       modelHistory: [],
       modelRequestCounts: {},
+      requestsByFeature: {},
       latencies: [],
+      totalLatencyMs: 0,
+      averageLatencyMs: 0,
+      successCount: 0,
+      cancelledCount: 0,
+      errorCount: 0,
+      retryRequests: 0,
       requestIds: [],
       finishReasons: {},
       sessionArtifacts: [],
+      processedRequestIds: {},
       lifecycleByRequestId: {},
       orphanRequestCounter: 0,
       observedCharCount: 0,
@@ -672,6 +701,8 @@ export class TelemetryService implements vscode.Disposable {
       modelCosts: {},
       estimatedBurnRatePerHour: 0,
       recentEvents: [],
+      timeline: [],
+      modelLatencyStats: {},
     };
   }
 }

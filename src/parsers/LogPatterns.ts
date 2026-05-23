@@ -64,6 +64,21 @@ export const FINISH_REASON = /finish[_\s]?reason[=:\s"]+([a-zA-Z_]+)/i;
 export const PROVIDER = /provider(?:Name)?[=:\s"]+([a-zA-Z0-9._-]+)/i;
 
 /**
+ * Canonical runtime event format observed in Copilot logs.
+ * Example:
+ *   ccreq:60c6ab57.copilotmd | success | gpt-5.3-codex | 9068ms | [panel/editAgent]
+ */
+export const CANONICAL_EVENT =
+  /ccreq:([a-z0-9]+)\.copilotmd\s*\|\s*(success|failed|failure|error|cancelled)\s*\|\s*([a-zA-Z0-9._-]+)\s*\|\s*(\d{2,6})ms\s*\|\s*\[([^\]]+)\]/i;
+
+/**
+ * Extracts source type from bracket tags when available.
+ * Example:
+ *   [panel/editAgent]
+ */
+export const SOURCE_TYPE_BRACKET = /\[([^\]]+)\]/;
+
+/**
  * Extracts session artifact identifiers.
  * Observed format: "ccreq:xxxx.copilotmd"
  */
@@ -75,6 +90,7 @@ export const SESSION_ARTIFACT = /ccreq:([a-z0-9.]+)/i;
  */
 export function isRelevantLine(line: string): boolean {
   return (
+    CANONICAL_EVENT.test(line) ||
     REQUEST_DONE.test(line) ||
     LATENCY_MS.test(line) ||
     MODEL_NAME.test(line) ||

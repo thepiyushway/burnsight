@@ -18,7 +18,7 @@ export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel('BurnSight Telemetry', { log: true });
 
   const telemetryService = TelemetryService.initialize(bus, output);
-  const logParser = new CopilotLogParser(bus, output, context.logUri.fsPath);
+  const logParser = new CopilotLogParser(bus, output, context.logUri.fsPath, context.globalState);
   const runtimeInspector = new RuntimeInspector(bus, output);
   const overlayPanel = new OverlayPanel(context, telemetryService, bus);
 

@@ -24,12 +24,20 @@ export enum SessionState {
 }
 
 export type CopilotLifecycleStage =
+  | 'request_started'
   | 'request_done'
   | 'model_seen'
   | 'latency_seen'
   | 'finish_reason_seen'
   | 'artifact_seen'
   | 'other';
+
+export type CopilotSourceType =
+  | 'panel/editAgent'
+  | 'copilotLanguageModelWrapper'
+  | 'title'
+  | 'progressMessages'
+  | 'unknown';
 
 // ---------------------------------------------------------------------------
 // A single parsed event from the GitHub Copilot Chat output channel log.
@@ -40,12 +48,18 @@ export interface CopilotLogEvent {
   timestamp: number;
   /** Raw log line text (truncated to 200 chars) — REAL */
   raw: string;
+  /** Canonical raw line used by accounting and timeline systems */
+  rawLine: string;
   /** Model name extracted from log, e.g. "gpt-4o-mini-2024-07-18" — REAL */
   model?: string;
   /** Request latency in ms extracted from log, e.g. 1746 — REAL */
   latencyMs?: number;
+  /** Success marker extracted from canonical lifecycle events — REAL */
+  success?: boolean;
+  /** Source classification extracted from event stream — REAL */
+  sourceType?: CopilotSourceType | string;
   /** Copilot request ID extracted from log — REAL */
-  requestId?: string;
+  requestId: string;
   /** Finish reason extracted from log (stop, length, cancelled, …) — REAL */
   finishReason?: string;
   /** Session artifact ID (ccreq:xxxx.copilotmd) — REAL */
@@ -58,6 +72,8 @@ export interface CopilotLogEvent {
   observedChars: number;
   /** Source log file where this line was observed — REAL */
   sourceFile?: string;
+  /** Byte offset of the parsed line within its source file */
+  fileOffset: number;
   /** Classified lifecycle stage for internal tracking — REAL */
   stage: CopilotLifecycleStage;
   /** Fingerprint used to deduplicate repeated line emissions */
@@ -74,8 +90,23 @@ export interface RequestLifecycleState {
   finishReason?: string;
   sessionArtifact?: string;
   provider?: string;
+  sourceType?: CopilotSourceType | string;
+  success?: boolean;
   accumulatedChars: number;
   seenRequestDone: boolean;
+  accounted: boolean;
+}
+
+export interface SessionTimelineEvent {
+  requestId: string;
+  phase: 'request_start' | 'request_complete';
+  model: string;
+  sourceType: string;
+  latencyMs: number;
+  success: boolean;
+  estimatedCostUsd: number;
+  timestamp: number;
+  rawLine: string;
 }
 
 export interface DerivedMetric {
@@ -108,14 +139,28 @@ export interface TelemetryState {
   modelHistory: string[];
   /** Per-model request counts: modelName → count */
   modelRequestCounts: Record<string, number>;
+  /** Per-feature/workflow request counts: feature → count */
+  requestsByFeature: Record<string, number>;
   /** Wall-clock latency in ms for each completed request */
   latencies: number[];
+  /** Total latency in ms across completed requests */
+  totalLatencyMs: number;
+  /** Average latency in ms across completed requests */
+  averageLatencyMs: number;
+  /** Request result counters */
+  successCount: number;
+  cancelledCount: number;
+  errorCount: number;
+  /** Requests classified as retries */
+  retryRequests: number;
   /** Unique request IDs observed (used for deduplication) */
   requestIds: string[];
   /** Finish reason histogram: reason → count */
   finishReasons: Record<string, number>;
   /** Session artifacts observed (ccreq:*.copilotmd) */
   sessionArtifacts: string[];
+  /** Processed request IDs to guarantee accounting dedup */
+  processedRequestIds: Record<string, true>;
 
   // ---- Lifecycle accumulators (REAL) -----------------------------------
   /** Latest lifecycle data per requestId */
@@ -154,6 +199,10 @@ export interface TelemetryState {
   // ---- Debug / audit ring buffer (REAL) ----------------------------------
   /** Most recent parsed log events, newest first; max 50 entries */
   recentEvents: CopilotLogEvent[];
+  /** Chronological request timeline used for observability */
+  timeline: SessionTimelineEvent[];
+  /** Per-model latency accumulation for average latency analytics */
+  modelLatencyStats: Record<string, { totalMs: number; count: number }>;
 }
 
 // ---------------------------------------------------------------------------

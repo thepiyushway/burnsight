@@ -1,28 +1,20 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import * as fs from 'fs';
 import { CopilotLogEvent, BurnSightEvents } from '../telemetry/types';
 import { EventBus } from '../utils/EventBus';
 import * as Patterns from './LogPatterns';
+import {
+  CopilotLogDiscovery,
+  CopilotTelemetryFileMetadata,
+} from '../telemetry/discovery/CopilotLogDiscovery';
 
 /**
  * Observes GitHub Copilot Chat log files and emits parsed CopilotLogEvent
  * instances onto the event bus.
  *
- * ARCHITECTURAL ASSUMPTION:
- * VSCode stores all extension host logs for a session in sibling directories
- * under the exthost log folder. Our extension context provides a log path:
- *   .../logs/<session>/exthost<N>/buildingpiyush.burnsight/
- *
- * By navigating two levels up we reach the session root:
- *   .../logs/<session>/
- *
- * We then scan that directory for any subfolder whose name contains "copilot"
- * (case-insensitive) to locate GitHub Copilot / Copilot Chat logs.
- *
- * If no Copilot log directory is found (e.g. Copilot is not installed or the
- * log path layout differs) the parser remains idle.  All metrics default to
- * zero — no fake data is substituted.
+ * Discovery is delegated to CopilotLogDiscovery, which recursively scans VS Code
+ * log roots and validates files by telemetry content signatures (not file names
+ * or folder conventions). Only validated files are watched and ingested.
  *
  * ONLY uses:
  *   - extension context log path (VS Code API)
@@ -40,31 +32,27 @@ export class CopilotLogParser implements vscode.Disposable {
   private readonly recentLineFingerprints = new Map<string, number>();
   private readonly dedupeWindowMs = 3000;
   private readonly acceptedWatcherPaths = new Set<string>();
+  private readonly discovery: CopilotLogDiscovery;
+  private readonly fileMetadata = new Map<string, CopilotTelemetryFileMetadata>();
+  private readonly checkpointKey = 'burnsight.copilotLogParser.checkpoints';
 
   private readonly hardIgnoreTokens = [
     'burnsight',
     'telemetry',
     'runtimeinspector',
     'extension-output',
-  ] as const;
-
-  private readonly acceptedSourceTokens = [
-    'github.copilot',
-    'github.copilot-chat',
-    'copilot-chat',
-    'copilotmd',
-    'ccreq',
-    'copilot',
-    'github-authentication',
-    'github.authentication',
+    'outputchannel',
+    'output channels',
   ] as const;
 
   constructor(
     private readonly bus: EventBus<BurnSightEvents>,
     log: vscode.LogOutputChannel,
-    private readonly extensionLogPath: string
+    private readonly extensionLogPath: string,
+    private readonly checkpointStore?: vscode.Memento
   ) {
     this.log = log;
+    this.discovery = new CopilotLogDiscovery(this.log);
     this.log.info('[CopilotLogParser] Initializing');
     this.discoverAndWatch();
   }
@@ -73,163 +61,18 @@ export class CopilotLogParser implements vscode.Disposable {
   // Discovery
   // --------------------------------------------------------------------------
 
-  /**
-  * Navigates from our extension log directory up to the session folder,
-  * then scans recursively for Copilot log directories.
-   */
   private discoverAndWatch(): void {
-    try {
-      const ourLogPath = this.extensionLogPath;
-      // e.g. .../logs/<session>/exthost1/buildingpiyush.burnsight
-      // sessionDir = .../logs/<session>
-      const sessionDir = path.dirname(path.dirname(ourLogPath));
-      this.log.info(`[CopilotLogParser] Scanning session dir: ${sessionDir}`);
-
-      const copilotDirs = this.findCopilotLogDirs(sessionDir);
-
-      if (copilotDirs.length === 0) {
-        this.log.warn(
-          '[CopilotLogParser] No Copilot log directories found. ' +
-          'Ensure GitHub Copilot / Copilot Chat is installed and active. ' +
-          'BurnSight will show zeros until log files appear.'
-        );
-        // Watch the session dir so we can detect directories created later
-        this.watchForNewCopilotDirs(sessionDir);
-        return;
-      }
-
-      for (const dir of copilotDirs) {
-        this.watchDirectory(dir);
-      }
-
+    this.log.info(`[CopilotLogParser] Discovery anchored from extension log path: ${this.extensionLogPath}`);
+    this.discovery.start((filePath, metadata) => {
+      this.fileMetadata.set(filePath, metadata);
+      this.acceptedWatcherPaths.add(filePath);
+      this.readNewContent(filePath);
       this.logAcceptedWatcherSummary();
-    } catch (err) {
-      this.log.error(`[CopilotLogParser] Discovery failed: ${String(err)}`);
-    }
-  }
-
-  /** Returns all subdirectory paths whose name contains "copilot" */
-  private findCopilotLogDirs(sessionDir: string): string[] {
-    const results: string[] = [];
-
-    const visit = (dir: string, depth: number): void => {
-      if (depth > 5) {
-        return;
-      }
-
-      let entries: fs.Dirent[] = [];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-
-      for (const entry of entries) {
-        if (!entry.isDirectory()) {
-          continue;
-        }
-
-        const childPath = path.join(dir, entry.name);
-        if (this.shouldIgnoreFile(childPath)) {
-          this.log.info(`[WATCHER] ignored self-log: ${childPath}`);
-          continue;
-        }
-
-        if (/github\.copilot-chat/i.test(entry.name) || /copilot/i.test(entry.name)) {
-          results.push(childPath);
-        }
-        visit(childPath, depth + 1);
-      }
-    };
-
-    try {
-      visit(sessionDir, 0);
-      return [...new Set(results)];
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Watches the exthost directory for newly created subdirectories.
-   * If a Copilot directory appears after activation, we start watching it.
-   */
-  private watchForNewCopilotDirs(sessionDir: string): void {
-    try {
-      const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(vscode.Uri.file(sessionDir), '**/*')
-      );
-      watcher.onDidCreate((uri) => {
-        try {
-          if (this.shouldIgnoreFile(uri.fsPath)) {
-            this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
-            return;
-          }
-
-          if (fs.statSync(uri.fsPath).isDirectory() && /copilot/i.test(path.basename(uri.fsPath))) {
-            this.log.info(`[CopilotLogParser] Copilot dir appeared: ${uri.fsPath}`);
-            this.watchDirectory(uri.fsPath);
-            this.logAcceptedWatcherSummary();
-          }
-        } catch {
-          // ignore
-        }
-      });
-      this.subscriptions.push(watcher);
-    } catch {
-      // Non-fatal — just means late-appearing directories won't be picked up
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // File watching
-  // --------------------------------------------------------------------------
-
-  /** Reads existing log files in the directory and installs a watcher. */
-  private watchDirectory(dir: string): void {
-    if (this.shouldIgnoreFile(dir)) {
-      this.log.info(`[WATCHER] ignored self-log: ${dir}`);
-      return;
-    }
-
-    this.log.info(`[WATCHER] accepted copilot-log: ${dir}`);
-    this.acceptedWatcherPaths.add(dir);
-    this.log.info(`[CopilotLogParser] Watching directory: ${dir}`);
-
-    // Ingest any log lines already written before we started
-    try {
-      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
-      for (const file of files) {
-        const filePath = path.join(dir, file);
-        if (this.shouldIgnoreFile(filePath)) {
-          this.log.info(`[WATCHER] ignored self-log: ${filePath}`);
-          continue;
-        }
-        this.log.info(`[WATCHER] accepted copilot-log: ${filePath}`);
-        this.readNewContent(filePath);
-      }
-    } catch { /* ignore — directory may be temporarily unavailable */ }
-
-    // Watch for appended content going forward
-    const pattern = new vscode.RelativePattern(vscode.Uri.file(dir), '**/*.log');
-    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-    watcher.onDidChange((uri) => {
-      if (this.shouldIgnoreFile(uri.fsPath)) {
-        this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
-        return;
-      }
-      this.log.info(`[WATCHER] accepted copilot-log: ${uri.fsPath}`);
-      this.readNewContent(uri.fsPath);
     });
-    watcher.onDidCreate((uri) => {
-      if (this.shouldIgnoreFile(uri.fsPath)) {
-        this.log.info(`[WATCHER] ignored self-log: ${uri.fsPath}`);
-        return;
-      }
-      this.log.info(`[WATCHER] accepted copilot-log: ${uri.fsPath}`);
-      this.readNewContent(uri.fsPath);
-    });
-    this.subscriptions.push(watcher);
+
+    if (this.discovery.getAcceptedFiles().length === 0) {
+      this.log.warn('[CopilotLogParser] Recursive scan completed with zero validated telemetry files.');
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -249,8 +92,12 @@ export class CopilotLogParser implements vscode.Disposable {
 
     try {
       const stats = fs.statSync(filePath);
-      const lastPos = this.filePositions.get(filePath) ?? 0;
+      const checkpointPos = this.getCheckpoint(filePath);
+      const inMemoryPos = this.filePositions.get(filePath) ?? 0;
+      const lastPos = Math.min(stats.size, Math.max(checkpointPos, inMemoryPos));
       if (stats.size <= lastPos) {
+        this.filePositions.set(filePath, stats.size);
+        this.saveCheckpoint(filePath, stats.size);
         return; // no new bytes
       }
 
@@ -261,16 +108,22 @@ export class CopilotLogParser implements vscode.Disposable {
       fs.closeSync(fd);
 
       this.filePositions.set(filePath, stats.size);
+      this.saveCheckpoint(filePath, stats.size);
 
       const newContent = (this.fileRemainders.get(filePath) ?? '') + buffer.toString('utf-8');
       const lines = newContent.split(/\r?\n/);
       const trailing = lines.pop() ?? '';
       this.fileRemainders.set(filePath, trailing);
 
+      let offsetCursor = lastPos;
       for (const line of lines) {
         const trimmed = line.trim();
+        const lineBytes = Buffer.byteLength(line + '\n', 'utf-8');
+        const lineOffset = offsetCursor;
+        offsetCursor += lineBytes;
+
         if (trimmed.length > 0) {
-          this.parseLine(trimmed, filePath);
+          this.parseLine(trimmed, filePath, lineOffset);
         }
       }
     } catch (err) {
@@ -287,9 +140,8 @@ export class CopilotLogParser implements vscode.Disposable {
    * Only processes lines that contain at least one relevant telemetry field.
    * CONFIDENCE of extracted fields: REAL (see LogPatterns.ts for rationale).
    */
-  private parseLine(line: string, sourceFile: string): void {
+  private parseLine(line: string, sourceFile: string, fileOffset: number): void {
     if (this.shouldIgnoreSourceLine(sourceFile, line)) {
-      this.log.info('[WATCHER] ignored self-log');
       return;
     }
 
@@ -302,6 +154,8 @@ export class CopilotLogParser implements vscode.Disposable {
       return;
     }
 
+    const canonicalMatch = Patterns.CANONICAL_EVENT.exec(line);
+
     const hasRequestDone = Patterns.REQUEST_DONE.test(line);
     const hasModel = Patterns.MODEL_NAME.test(line);
     const hasLatency = Patterns.LATENCY_MS.test(line);
@@ -310,7 +164,9 @@ export class CopilotLogParser implements vscode.Disposable {
     const hasProvider = Patterns.PROVIDER.test(line);
 
     let stage: CopilotLogEvent['stage'] = 'other';
-    if (hasRequestDone) {
+    if (canonicalMatch) {
+      stage = 'request_done';
+    } else if (hasRequestDone) {
       stage = 'request_done';
     } else if (hasFinishReason) {
       stage = 'finish_reason_seen';
@@ -324,16 +180,34 @@ export class CopilotLogParser implements vscode.Disposable {
       stage = 'other';
     }
 
+    const requestIdFromCanonical = canonicalMatch?.[1];
+    const requestIdFromLine = Patterns.REQUEST_ID.exec(line)?.[1];
+    const requestId =
+      requestIdFromCanonical ?? requestIdFromLine ?? `unknown-${Date.now()}-${Math.abs(hashCode(line))}`;
+
     const event: CopilotLogEvent = {
       timestamp: Date.now(),
       // Truncate to 200 chars to keep the ring buffer compact
       raw: line.length > 200 ? line.slice(0, 197) + '…' : line,
+      rawLine: line,
+      requestId,
       requestDone: hasRequestDone,
       observedChars: line.length,
       sourceFile,
+      fileOffset,
       stage,
       fingerprint,
+      sourceType: this.fileMetadata.get(sourceFile)?.sourceType,
     };
+
+    if (canonicalMatch) {
+      event.success = canonicalMatch[2].toLowerCase() === 'success';
+      event.model = canonicalMatch[3];
+      event.latencyMs = parseInt(canonicalMatch[4], 10);
+      event.sessionArtifact = `${canonicalMatch[1]}.copilotmd`;
+      event.sourceType = this.normalizeSourceType(canonicalMatch[5]);
+      event.requestDone = true;
+    }
 
     const modelMatch = Patterns.MODEL_NAME.exec(line);
     if (modelMatch) {
@@ -343,11 +217,6 @@ export class CopilotLogParser implements vscode.Disposable {
     const latencyMatch = Patterns.LATENCY_MS.exec(line);
     if (latencyMatch) {
       event.latencyMs = parseInt(latencyMatch[1], 10);
-    }
-
-    const requestIdMatch = Patterns.REQUEST_ID.exec(line);
-    if (requestIdMatch) {
-      event.requestId = requestIdMatch[1];
     }
 
     const finishReasonMatch = Patterns.FINISH_REASON.exec(line);
@@ -365,8 +234,49 @@ export class CopilotLogParser implements vscode.Disposable {
       event.provider = providerMatch[1].toLowerCase();
     }
 
+    const sourceTypeMatch = Patterns.SOURCE_TYPE_BRACKET.exec(line);
+    if (!event.sourceType && sourceTypeMatch) {
+      event.sourceType = this.normalizeSourceType(sourceTypeMatch[1]);
+    }
+
+    if (event.success === undefined && hasRequestDone) {
+      event.success = true;
+    }
+
     this.log.info(`[CopilotLogParser] event=${JSON.stringify(event)}`);
     this.bus.emit('copilot.request', event);
+  }
+
+  private getCheckpoint(filePath: string): number {
+    const checkpoints = this.checkpointStore?.get<Record<string, number>>(this.checkpointKey) ?? {};
+    return checkpoints[filePath] ?? 0;
+  }
+
+  private saveCheckpoint(filePath: string, offset: number): void {
+    if (!this.checkpointStore) {
+      return;
+    }
+
+    const checkpoints = this.checkpointStore.get<Record<string, number>>(this.checkpointKey) ?? {};
+    checkpoints[filePath] = offset;
+    void this.checkpointStore.update(this.checkpointKey, checkpoints);
+  }
+
+  private normalizeSourceType(rawSource: string): CopilotLogEvent['sourceType'] {
+    const source = rawSource.trim();
+    if (source === 'panel/editAgent') {
+      return 'panel/editAgent';
+    }
+    if (source === 'copilotLanguageModelWrapper') {
+      return 'copilotLanguageModelWrapper';
+    }
+    if (source === 'title') {
+      return 'title';
+    }
+    if (source === 'progressMessages') {
+      return 'progressMessages';
+    }
+    return source || 'unknown';
   }
 
   private createFingerprint(line: string, sourceFile: string): string {
@@ -394,16 +304,7 @@ export class CopilotLogParser implements vscode.Disposable {
   private shouldIgnoreFile(filePath: string): boolean {
     const normalized = filePath.toLowerCase();
     const hasHardIgnoreToken = this.hardIgnoreTokens.some((token) => normalized.includes(token));
-    if (hasHardIgnoreToken) {
-      return true;
-    }
-
-    const hasAcceptedToken = this.acceptedSourceTokens.some((token) => normalized.includes(token));
-    if (!hasAcceptedToken) {
-      return true;
-    }
-
-    return false;
+    return hasHardIgnoreToken;
   }
 
   private shouldIgnoreSourceLine(sourceFile: string, line: string): boolean {
@@ -443,6 +344,16 @@ export class CopilotLogParser implements vscode.Disposable {
   // --------------------------------------------------------------------------
 
   public dispose(): void {
+    this.discovery.dispose();
     vscode.Disposable.from(...this.subscriptions).dispose();
   }
+}
+
+function hashCode(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
 }
