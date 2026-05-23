@@ -68,6 +68,7 @@ export class CopilotLogParser implements vscode.Disposable {
       this.fileMetadata.set(filePath, metadata);
       const isFirstAttach = !this.acceptedWatcherPaths.has(filePath);
       this.acceptedWatcherPaths.add(filePath);
+      this.log.info(`[WATCHER] discovery callback filePath=${filePath} isFirstAttach=${isFirstAttach}`);
       if (isFirstAttach) {
         this.attachTailAtEof(filePath);
       } else {
@@ -100,7 +101,20 @@ export class CopilotLogParser implements vscode.Disposable {
       const stats = fs.statSync(filePath);
       const checkpointPos = this.getCheckpoint(filePath);
       const inMemoryPos = this.filePositions.get(filePath) ?? stats.size;
-      const lastPos = Math.min(stats.size, Math.max(checkpointPos, inMemoryPos));
+
+      // Truncation guard: if we tracked a position beyond the current file size
+      // the file was truncated or rotated at the same path — reset to read from 0.
+      if (inMemoryPos > stats.size) {
+        this.log.warn(
+          `[APPEND] truncation detected file=${filePath} trackedPos=${inMemoryPos} currentSize=${stats.size} — resetting offset`
+        );
+        this.filePositions.set(filePath, 0);
+        this.saveCheckpoint(filePath, 0);
+      }
+
+      const resolvedPos = this.filePositions.get(filePath) ?? 0;
+      const resolvedCheckpoint = checkpointPos > stats.size ? 0 : checkpointPos;
+      const lastPos = Math.min(stats.size, Math.max(resolvedCheckpoint, resolvedPos));
       if (stats.size <= lastPos) {
         this.filePositions.set(filePath, stats.size);
         this.saveCheckpoint(filePath, stats.size);

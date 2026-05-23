@@ -30,6 +30,7 @@ export class CopilotLogDiscovery implements vscode.Disposable {
   private readonly validationCache = new Map<string, ValidationCacheEntry>();
   private readonly acceptedFiles = new Map<string, CopilotTelemetryFileMetadata>();
   private readonly watcherByFile = new Map<string, vscode.FileSystemWatcher>();
+  private readonly nativeWatcherByFile = new Map<string, import('fs').FSWatcher>();
   private readonly debounceTimers = new Map<string, NodeJS.Timeout>();
   private rescanTimer: NodeJS.Timeout | undefined;
   private readonly sourceClassifier = new TelemetrySourceClassifier();
@@ -66,6 +67,15 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       watcher.dispose();
     }
     this.watcherByFile.clear();
+
+    for (const nativeWatcher of this.nativeWatcherByFile.values()) {
+      try {
+        nativeWatcher.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    this.nativeWatcherByFile.clear();
   }
 
   private runDiscovery(
@@ -121,6 +131,16 @@ export class CopilotLogDiscovery implements vscode.Disposable {
     for (const metadata of newlyAccepted) {
       this.attachWatcher(metadata, onValidatedFileEvent);
       onValidatedFileEvent(metadata.sourcePath, metadata);
+    }
+
+    // On every rescan (30-second interval), also poll already-accepted files for
+    // any content that the watchers may have missed. readNewContent is append-only
+    // and idempotent — it returns immediately if there are no new bytes.
+    if (newlyAccepted.length === 0) {
+      for (const [filePath, metadata] of this.acceptedFiles.entries()) {
+        this.log.info(`[DISCOVERY] rescan poll for known file file=${filePath}`);
+        onValidatedFileEvent(filePath, metadata);
+      }
     }
   }
 
@@ -291,10 +311,6 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       return;
     }
 
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(path.dirname(filePath), path.basename(filePath))
-    );
-
     const scheduleRead = () => {
       this.log.info(`[WATCHER] fs.watch callback fired file=${filePath}`);
       const existing = this.debounceTimers.get(filePath);
@@ -311,12 +327,41 @@ export class CopilotLogDiscovery implements vscode.Disposable {
       this.debounceTimers.set(filePath, timer);
     };
 
-    watcher.onDidChange(() => scheduleRead());
-    watcher.onDidCreate(() => scheduleRead());
+    // PRIMARY: Node.js native fs.watch — direct OS FSEvents, reliable for any file path
+    // including files outside VS Code workspace roots where createFileSystemWatcher
+    // may silently miss change events.
+    try {
+      const nativeWatcher = fs.watch(filePath, { persistent: false }, (eventType) => {
+        this.log.info(`[WATCHER] native fs.watch event=${eventType} file=${filePath}`);
+        scheduleRead();
+      });
+      nativeWatcher.on('error', (err) => {
+        this.log.warn(`[WATCHER] native fs.watch error file=${filePath}: ${String(err)}`);
+      });
+      this.nativeWatcherByFile.set(filePath, nativeWatcher);
+      this.log.info(`[WATCHER] native fs.watch attached file=${filePath}`);
+    } catch (err) {
+      this.log.warn(`[WATCHER] native fs.watch attach failed file=${filePath}: ${String(err)}`);
+    }
 
-    this.watcherByFile.set(filePath, watcher);
-    this.subscriptions.push(watcher);
-    this.log.info(`[DISCOVERY] watcher attached: ${filePath}`);
+    // SECONDARY: VS Code FileSystemWatcher — kept for integration, may not fire
+    // reliably outside workspace folders but provides additional coverage.
+    const vscodeWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(path.dirname(filePath)), path.basename(filePath))
+    );
+
+    vscodeWatcher.onDidChange(() => {
+      this.log.info(`[WATCHER] vscode watcher onDidChange fired file=${filePath}`);
+      scheduleRead();
+    });
+    vscodeWatcher.onDidCreate(() => {
+      this.log.info(`[WATCHER] vscode watcher onDidCreate fired file=${filePath}`);
+      scheduleRead();
+    });
+
+    this.watcherByFile.set(filePath, vscodeWatcher);
+    this.subscriptions.push(vscodeWatcher);
+    this.log.info(`[WATCHER] vscode watcher attached file=${filePath}`);
   }
 
   private getSourceType(filePath: string): string {

@@ -14,16 +14,27 @@ import { OverlayPanel } from './ui/OverlayPanel';
 import { EventBus } from './utils/EventBus';
 
 export function activate(context: vscode.ExtensionContext) {
-  const bus = new EventBus<BurnSightEvents>();
   const output = vscode.window.createOutputChannel('BurnSight Telemetry', { log: true });
+  output.info('[BOOT] BurnSight activating — extensionLogPath=' + context.logUri.fsPath);
+
+  const bus = new EventBus<BurnSightEvents>();
+  output.info('[BOOT] EventBus created');
 
   const telemetryService = TelemetryService.initialize(bus, output);
+  output.info('[BOOT] TelemetryService initialized — singleton id=' + (TelemetryService as unknown as { instance?: unknown }).instance?.constructor?.name);
+
   const logParser = new CopilotLogParser(bus, output, context.logUri.fsPath, context.globalState);
+  output.info('[BOOT] CopilotLogParser created');
+
   const runtimeInspector = new RuntimeInspector(bus, output);
+  output.info('[BOOT] RuntimeInspector created');
+
   const overlayPanel = new OverlayPanel(context, bus, output);
+  output.info('[BOOT] OverlayPanel created');
 
   registerOpenOverlayCommand(context, overlayPanel);
   registerToggleDebugModeCommand(context);
+  output.info('[BOOT] Commands registered');
 
   const statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
@@ -68,6 +79,7 @@ export function activate(context: vscode.ExtensionContext) {
     telemetryService,
     overlayPanel
   );
-}
 
+  output.info('[BOOT] Activation complete — all components registered');
+}
 export function deactivate() {}
